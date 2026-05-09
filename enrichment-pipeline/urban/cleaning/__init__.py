@@ -1,10 +1,11 @@
 from .base import BaseCleaner, CANONICAL_SCHEMA, QualityConfig
 from .porto import PortoCleaner
 from .pneuma import PNEUMACleaner
+from .tdrive import TDriveCleaner
 from .sampling import grid_sample_ids
 
 __all__ = [
     'BaseCleaner', 'CANONICAL_SCHEMA', 'QualityConfig',
-    'PortoCleaner', 'PNEUMACleaner',
+    'PortoCleaner', 'PNEUMACleaner', 'TDriveCleaner',
     'grid_sample_ids'
 ]
