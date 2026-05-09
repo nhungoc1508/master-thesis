@@ -216,7 +216,7 @@ class BaseCleaner(ABC):
 
         return [
             {
-                'trajectofy_id':  tid,
+                'trajectory_id':  tid,
                 'point_idx':      int(i),
                 'lat':            float(lats[i]),
                 'lon':            float(lons[i]),

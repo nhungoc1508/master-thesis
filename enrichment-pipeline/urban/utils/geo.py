@@ -10,7 +10,7 @@ def haversine_vectorized(lat1: np.ndarray, lon1: np.ndarray,
     a = np.sin(dphi / 2) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlam / 2) ** 2
     return 2 * R * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
 
-def bbox_diagonal_m(lats: np.darray, lons: np.ndarray) -> float:
+def bbox_diagonal_m(lats: np.ndarray, lons: np.ndarray) -> float:
     """Diagonal of the bounding box of a set of coordinates, in meters"""
     return haversine_vectorized(
         np.array([lats.min()]), np.array([lons.min()]),
