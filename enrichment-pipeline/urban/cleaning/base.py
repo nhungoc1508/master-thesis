@@ -239,5 +239,5 @@ def _flush(
     table = pa.Table.from_pylist(batch, schema=schema)
     if writer is None:
         writer = pq.ParquetWriter(output_path, schema)
-        writer.write_table(table)
-        return writer
+    writer.write_table(table)
+    return writer
