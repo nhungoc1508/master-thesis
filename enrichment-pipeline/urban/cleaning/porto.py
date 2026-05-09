@@ -6,6 +6,8 @@ Raw format (train.csv):
     TIMESTAMP (unix s, trip start), DAY_TYPE, MISSING_DATA,
     POLYLINE (JSON [[lon, lat], ...], 15-second intervals)
     Coordinates in WGS-84
+
+Source: https://www.kaggle.com/datasets/crailtap/taxi-trajectory
 """
 from __future__ import annotations
 

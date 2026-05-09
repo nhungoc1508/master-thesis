@@ -38,7 +38,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from cleaning import (
-    PortoCleaner,
+    PortoCleaner, PNEUMACleaner,
     grid_sample_ids
 )
 
@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 CLEANERS = {
     'porto': PortoCleaner,
+    'pneuma': PNEUMACleaner
 }
 
 def _filter_parquet_by_ids(input_path: Path, output_path: Path, ids: set[str]) -> int:
