@@ -35,7 +35,7 @@ from .base import BaseCleaner, QualityConfig
 logger = logging.getLogger(__name__)
 
 # Filename: YYYYMMDD_dN_HHMM_
-_FNAME_RE = re.compile(r'(\d{4})(\d{2})(\d{2})_d\d+_(\d{2})(\d{2})_')
+_FNAME_RE = re.compile(r'(\d{4})(\d{2})(\d{2})_d\w+_(\d{2})(\d{2})_')
 
 _TYPE_MAP = {
     'Car':            'car',
