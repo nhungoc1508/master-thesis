@@ -51,7 +51,7 @@ def grid_sample_ids(
 
     # ---------- Assign grid cells ----------
     lat_min, lat_max = agg['lat_mid'].min(), agg['lat_mid'].max()
-    lon_min, lon_max = agg['lon_mid'].min(), agg['lat_mid'].max()
+    lon_min, lon_max = agg['lon_mid'].min(), agg['lon_mid'].max()
 
     eps = 1e-9
     agg['row'] = np.floor(
