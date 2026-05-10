@@ -1,0 +1,85 @@
+quality_filters:
+  min_points: 10
+  min_duration_s: 60.0
+  max_speed_kmh: 180.0
+  min_displacement_m: 100.0
+
+behavioral:
+  stop_speed_ms: 0.5
+  slow_speed_ms: 1.5
+  speed_window: 3
+
+road_network:
+  snap_radius_m: 50
+  osmnx_network_type: drive
+
+poi_profiles:
+  radii_m: [50, 200, 500]
+  categories:
+    food_drink:
+      amenity: [restaurant, cafe, bar, fast_food, food_court, pub, ice_cream, bakery, biergarten]
+    retail:
+      shop: true
+    education:
+      amenity: [school, university, college, library, kindergarten]
+    healthcare:
+      amenity: [hospital, clinic, pharmacy, doctors, dentist, veterinary]
+    transport:
+      amenity: [bus_station, taxi, car_rental, bicycle_rental, fuel, parking]
+      railway: [station, halt, tram_stop, subway_entrance]
+      public_transport: [station, stop_position]
+    recreation:
+      leisure: [park, sports_centre, playground, gym, swimming_pool, stadium, fitness_centre]
+    accommodation:
+      tourism: [hotel, hostel, motel, guest_house, chalet]
+      amenity: [hotel]
+    office_finance:
+      office: true
+      amenity: [bank, atm]
+    religion:
+      amenity: [place_of_worship]
+    government:
+      amenity: [town_hall, police, fire_station, post_office, courthouse, embassy]
+    culture:
+      tourism: [museum, gallery, attraction, artwork, viewpoint]
+      amenity: [theatre, cinema, arts_centre, nightclub]
+  dedup_precision: 3
+
+land_use:
+  tags:
+    landuse: [residential, commercial, industrial, retail, recreation_ground,
+              forest, farmland, grass, cemetery, institutional, military,
+              religious, allotments, construction]
+    leisure: [park, nature_reserve, garden, golf_course]
+    amenity: [school, hospital, university, college]
+  dedup_precision: 3
+
+weather:
+  # era5_nc_path: data/weather_era5/san_francisco/
+  provider: open_meteo
+  archive_url: https://archive-api.open-meteo.com/v1/archive
+  variables:
+    - temperature_2m
+    - precipitation
+    - wind_speed_10m
+    - wind_direction_10m
+    - weather_code
+  use_city_coords: true
+  location_precision: 1
+  request_delay_s: 1.0
+
+city_osmnx_queries:
+  porto: "Porto, Portugal"
+  athens: "Athens Municipality, Attica, Greece"
+  beijing: "Beijing, China"
+  san_francisco: "San Francisco, California, USA"
+  new_york: "New York City, New York, USA"
+  rome: "Rome, Italy"
+
+city_bboxes:
+  porto:    [-8.70, 41.10, -8.55, 41.25]
+  athens:   [23.68, 37.96, 23.76, 38.00]
+  beijing:  [116.05, 39.70, 116.75, 40.15]
+  san_francisco:  [-122.52,  37.70, -122.33,  37.83]
+  new_york:       [ -74.05,  40.60,  -73.90,  40.92]
+  rome:           [  12.35,  41.80,   12.62,  41.98]

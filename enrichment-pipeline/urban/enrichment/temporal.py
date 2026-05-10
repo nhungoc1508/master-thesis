@@ -48,6 +48,14 @@ def enrich(df: pd.DataFrame) -> pd.DataFrame:
         return _enrich_partition(df, 'UTC')
 
     parts = []
+    for city, grp in df.groupby('city', sort=False):
+        tz = CITY_TIMEZONES.get(str(city).lower())
+        if tz is None:
+            logger.warning('City "%s" not in CITY_TIMEZONES; using UTC', city)
+            tz = 'UTC'
+        parts.append(_enrich_partition(grp.copy(), tz))
+
+    return pd.concat(parts, ignore_index=True)
 
 def _enrich_partition(df: pd.DataFrame, tz: str) -> pd.DataFrame:
     """Compute temporal features for a single-timezone partition"""
@@ -57,7 +65,7 @@ def _enrich_partition(df: pd.DataFrame, tz: str) -> pd.DataFrame:
     df['day_of_week']          = dt.dt.dayofweek.astype(np.int8)
     df['is_weekend']           = df['day_of_week'] >= 5
     df['month']                = dt.dt.month.astype(np.int8)
-    df['season']               = dt['month'].map(_month_to_season)
+    df['season']               = df['month'].map(_month_to_season)
     df['time_of_day_category'] = df['hour_of_day'].map(_hour_to_category)
     return df
 

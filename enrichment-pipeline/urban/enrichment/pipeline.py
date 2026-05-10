@@ -114,7 +114,7 @@ class EnrichmentPipeline:
         final_path = output_dir / f'{stem}_enriched.parquet'
 
         df, done_stages = self._load_checkpoint(ckpt_path, input_path)
-        logger.into('Loaded %d rows, completed stages: %s', len(df), done_stages or '(none)')
+        logger.info('Loaded %d rows, completed stages: %s', len(df), done_stages or '(none)')
 
         for stage in stages:
             if stage in done_stages:

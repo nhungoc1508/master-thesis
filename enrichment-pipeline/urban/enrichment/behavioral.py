@@ -53,7 +53,7 @@ def enrich(df: pd.DataFrame,
         seg_speed[-1] = spd[-1]
 
         # Assign acceleration
-        accel = np.zeroes(len(idx, dtype=np.float32))
+        accel = np.zeros(len(idx), dtype=np.float32)
         if len(spd) > 1:
             dspd = np.diff(spd)
             dt2 = dt[:-1]

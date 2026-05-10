@@ -49,7 +49,7 @@ class RoadNetworkEnricher:
         self.city_queries = city_queries
         self.city_bboxes = city_bboxes or {}
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self._tree: dict[str, tuple[STRtree, gpd.GeoDataFrame]] = {}
+        self._trees: dict[str, tuple[STRtree, gpd.GeoDataFrame]] = {}
 
     def enrich(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy()

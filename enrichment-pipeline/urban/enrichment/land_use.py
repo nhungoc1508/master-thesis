@@ -76,7 +76,7 @@ class LandUseEnricher:
         df['_lat_r'] = df['lat'].round(_DEDUP_PRECISION)
         df['_lon_r'] = df['lon'].round(_DEDUP_PRECISION)
         unique_pts = (df.drop_duplicates(['_lat_r', '_lon_r'])
-                      [['_lat_r', '_lon)r']].copy().reset_index(drop=True))
+                      [['_lat_r', '_lon_r']].copy().reset_index(drop=True))
 
         pts_gdf = gpd.GeoDataFrame(
             unique_pts,

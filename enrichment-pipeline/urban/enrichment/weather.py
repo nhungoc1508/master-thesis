@@ -135,7 +135,7 @@ class WeatherEnricher:
                     round(grp['lon'].median(), self.location_precision)
                 )
             )
-            if city-str not in CITY_WEATHER_COORDS:
+            if city_str not in CITY_WEATHER_COORDS:
                 logger.warning('City %d not in CITY_WEATHER_COORDS, using median coordinate (%.2f, %.2f)',
                                city_str, lat_r, lon_r)
                 
@@ -144,7 +144,7 @@ class WeatherEnricher:
             n_months = len(year_months)
 
             for ym_idx, (year, month) in enumerate(year_months, 1):
-                month_mask = (grp['_dt'.dt.year == year] & (grp['_dt'].dt.month == month))
+                month_mask = (grp['_dt'].dt.year == year) & (grp['_dt'].dt.month == month)
                 era5_nc = _find_era5_nc(city_str, year, month)
 
                 if era5_nc is not None:

@@ -94,7 +94,7 @@ class POIProfileEnricher:
         df['_lon_r'] = df['lon'].round(_DEDUP_PRECISION)
 
         unique_pts = (df.drop_duplicates(['_lat_r', '_lon_r'])
-                      [['_lat_r', '_lon)r']].copy().reset_index(drop=True))
+                      [['_lat_r', '_lon_r']].copy().reset_index(drop=True))
         
         # Project (unique) points to the same metric CRS as POIS
         pts_gdf = gpd.GeoDataFrame(
@@ -128,7 +128,7 @@ class POIProfileEnricher:
         if city in self._city_data:
             return self._city_data[city]
         
-        cache_file = self.cache_dif / f'{city}_pois.gpkg'
+        cache_file = self.cache_dir / f'{city}_pois.gpkg'
         if cache_file.exists():
             logger.info('Loading POIs from cache for %s', city)
             pois = gpd.read_file(cache_file)
@@ -163,7 +163,8 @@ class POIProfileEnricher:
         area = feats[is_area].copy()
         if not area.empty:
             area = area.copy()
-            area['geometry'] = area.geometry.centroid
+            utm_crs = area.estimate_utm_crs()
+            area['geometry'] = area.geometry.to_crs(utm_crs).centroid.to_crs('EPSG:4326')
             pts = gpd.GeoDataFrame(
                 pd.concat([pts, area], ignore_index=True),
                 crs='EPSG:4326'

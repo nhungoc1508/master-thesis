@@ -4,7 +4,7 @@ PHASE 1: Clean a raw mobility dataset and write canonical .parquet.
 
 Usage examples:
     Clean whole dataset:
-        python run_clean porto data/porto/train.csv data/canonical/porto.parquet
+        python run_clean.py porto data/porto/train.csv data/canonical/porto.parquet
 
     Clean + sample 120K trajectories (grid-based):
         python run_clean.py porto data/porto/train.csv data/canonical/porto.parquet \
