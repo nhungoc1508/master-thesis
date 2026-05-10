@@ -11,7 +11,7 @@ For each GPS point, find the nearest road edge and extracts:
     road_oneway     bool    True if one-way street
 
 Implementation details:
-    - OSM road networks are downloaded one per city and cached as GraphML files
+    - OSM road networks are downloaded one time per city and cached as GraphML files
     - Nearest edge lookup: Shapely's STRtree
     - Coordinates are deduplicated at 4 decimal places before lookup
 """
@@ -41,7 +41,7 @@ class RoadNetworkEnricher:
                  city_bboxes: dict[str, tuple[float, float, float, float]] | None = None):
         """
         Params:
-            cache_dir:      directory storying GraphML cache files
+            cache_dir:      directory storing GraphML cache files
             city_queries:   mapping from city name to osmnx place query string
             city_bboxes:    fallback bbox (W, S, E, N) bbox per city
         """

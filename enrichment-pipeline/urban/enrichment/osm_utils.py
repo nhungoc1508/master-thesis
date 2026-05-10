@@ -24,3 +24,14 @@ def graph_from_place_or_bbox(
         logger.debug('\tUsing bbox for %s (skipping Nominatim place query)', city)
         return ox.graph_from_bbox(bbox, network_type=network_type, simplify=True)
     return ox.graph_from_place(query, network_type=network_type, simplify=True)
+
+def features_from_place_or_bbox(
+        query: str, city: str,
+        city_bboxes: dict[str, tuple[float, float, float, float]],
+        tags: dict[str, Any]
+) -> gpd.GeoDataFrame:
+    bbox = city_bboxes.get(city)
+    if bbox is not None:
+        logger.debug('\tUsing bbox for %s (skipping Nominatim place query)', city)
+        return ox.features_from_bbox(bbox, tags=tags)
+    return ox.features_from_place(query, tags=tags)
