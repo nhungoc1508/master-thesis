@@ -1,0 +1,39 @@
+{
+  "datasets": [
+    {
+        "source": "porto",
+        "input": "data/canonical/porto.parquet",
+        "output": "data/described/"
+    },
+    {
+        "source": "pneuma",
+        "input": "data/enriched/pneuma_1024_enriched.parquet",
+        "output": "data/described/"
+    },
+    {
+        "source": "tdrive",
+        "input": "data/canonical/tdrive.parquet",
+        "output": "data/described/"
+    },
+    {
+        "source": "geolife",
+        "input": "data/canonical/geolife.parquet",
+        "output": "data/described/"
+    },
+    {
+        "source": "cabspotting",
+        "input": "data/canonical/cabspotting.parquet",
+        "output": "data/described/"
+    },
+    {
+        "source": "nyc_osm",
+        "input": "data/canonical/nyc.parquet",
+        "output": "data/described/"
+    },
+    {
+        "source": "rome",
+        "input": "data/canonical/rome.parquet",
+        "output": "data/described/"
+    }
+  ]
+}

@@ -11,9 +11,6 @@ Usage examples:
 
     Custom output directory and config
         python run_enrich.py data/canonical/porto.parquet --output-dir data/enriched/ --config config/enrichment_config.yaml
-
-    Inspect a sample of templates
-        python run_enrich.py data/canonical/porto.parquet --describe 5
 """
 import argparse
 import logging
@@ -34,7 +31,6 @@ def main():
     parser.add_argument('--output-dir', default='data/enriched')
     parser.add_argument('--cache-dir', default='data')
     parser.add_argument('--config', default='config/enrichment_config.yaml')
-    parser.add_argument('--describe', type=int, default=0, metavar='N')
     args = parser.parse_args()
 
     pipeline = EnrichmentPipeline.from_config(args.config, cache_root=args.cache_dir)
@@ -44,7 +40,6 @@ def main():
     
     for inp in inputs:
         out = pipeline.run(inp, output_dir=args.output_dir, stages=args.stages)
-        # if args.describe > 0: # todo
 
 if __name__ == '__main__':
     main()
