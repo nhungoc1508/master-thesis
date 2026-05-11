@@ -2,7 +2,7 @@
   "datasets": [
     {
         "source": "porto",
-        "input": "data/canonical/porto.parquet",
+        "input": "data/enriched/porto_enriched.parquet",
         "output": "data/described/"
     },
     {
@@ -12,27 +12,27 @@
     },
     {
         "source": "tdrive",
-        "input": "data/canonical/tdrive.parquet",
+        "input": "data/enriched/tdrive_enriched.parquet",
         "output": "data/described/"
     },
     {
         "source": "geolife",
-        "input": "data/canonical/geolife.parquet",
+        "input": "data/enriched/geolife_enriched.parquet",
         "output": "data/described/"
     },
     {
         "source": "cabspotting",
-        "input": "data/canonical/cabspotting.parquet",
+        "input": "data/enriched/cabspotting_enriched.parquet",
         "output": "data/described/"
     },
     {
         "source": "nyc_osm",
-        "input": "data/canonical/nyc.parquet",
+        "input": "data/enriched/nyc_enriched.parquet",
         "output": "data/described/"
     },
     {
         "source": "rome",
-        "input": "data/canonical/rome.parquet",
+        "input": "data/enriched/rome_enriched.parquet",
         "output": "data/described/"
     }
   ]

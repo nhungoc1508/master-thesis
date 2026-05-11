@@ -45,6 +45,7 @@ def describe(input_path: Path, output_dir: Path) -> Path:
         df['description'] = [
             generate_point_descriptor(row.to_dict()) for _, row in df.iterrows()
         ]
+        df = df[['trajectory_id', 'point_idx', 'description']]
         out_tbl = pa.Table.from_pandas(df, preserve_index=False)
         if writer is None:
             writer = pq.ParquetWriter(output_path, out_tbl.schema)
