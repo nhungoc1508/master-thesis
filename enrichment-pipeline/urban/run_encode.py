@@ -4,15 +4,16 @@ PHASE 4: Pre-compute semantic embeddings for per-point description
 
 Implementation details:
     - Read described .parquet files (cols: trajectory_id, point_idx, description)
-    - Encode every description using a frozen text encoder (current model used: baai/bge-m3)
+    - Encode every description using a frozen text encoder (current model used: jinaai/jina-embeddings-v3)
     - Write 2 files:
-        - data/encoded/[stem]_sem.npy           float16 memmap, shape (N, 1024)
+        - data/encoded/[stem]_sem.npy           float16 memmap, shape (N, embed_dim)
         - data/encoded/[stem]_sem_meta.json     row count, shape, dtype, source path
     - Row order in .npy file corresponds to row order in the source .parquet
 
 Usage examples:
     Encode one single file
-        python run_encode.py data/described/porto_enriched_described.parquet
+        python run_encode.py data/described/porto_enriched_described.parquet \\
+            --trust-remote-code --truncate-dim 256
 
     Custom output directory
         python run_encode.py data/described/porto_enriched_described.parquet --output-dir path/to/dir/
@@ -67,6 +68,8 @@ def encode_file(input_path: Path, output_dir: Path,
     dim = encoder.embed_dim
     logger.info('\t%d rows, output shape (%d, %d)',
                 n_rows, n_rows, dim)
+    dtype = np.float16
+    size_gb = n_rows * dim * np.dtype(dtype).itemsize / 1e9
     
     # ---------- Allocate output memmap ----------
     out_array = np.lib.format.open_memmap(
@@ -98,6 +101,8 @@ def encode_file(input_path: Path, output_dir: Path,
         'shape': [n_rows, dim],
         'dtype': 'float16',
         'normalized': encoder.normalize,
+        'truncate_dim': encoder.truncate_dim,
+        'size_gb': round(size_gb, 3),
         'time': dt
     }
     meta_path.write_text(json.dumps(meta, indent=4))
@@ -114,10 +119,12 @@ def main():
     group.add_argument('--all', metavar='DIR')
 
     parser.add_argument('--output-dir', default='data/encoded/')
-    parser.add_argument('--model', default='BAAI/bge-m3')
+    parser.add_argument('--model', default='jinaai/jina-embeddings-v3')
     parser.add_argument('--batch-size', type=int, default=1024)
     parser.add_argument('--device', default=None)
+    parser.add_argument('--trust-remote-code', action='store_true')
     parser.add_argument('--overwrite', action='store_true')
+    parser.add_argument('--truncate-dim', type=int, default=256, metavar='N')
 
     args = parser.parse_args()
 
@@ -126,7 +133,9 @@ def main():
     encoder = SemanticEncoder(
         model_name = args.model,
         device = args.device,
-        batch_size = args.batch_size
+        batch_size = args.batch_size,
+        trust_remote_code = args.trust_remote_code,
+        truncate_dim = args.truncate_dim
     )
 
     if args.all:
