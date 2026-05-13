@@ -75,11 +75,13 @@ city_osmnx_queries:
   san_francisco: "San Francisco, California, USA"
   new_york: "New York City, New York, USA"
   rome: "Rome, Italy"
+  hanoi: "Hanoi, Vietnam"
 
 city_bboxes:
-  porto:    [-8.70, 41.10, -8.55, 41.25]
-  athens:   [23.68, 37.96, 23.76, 38.00]
-  beijing:  [116.05, 39.70, 116.75, 40.15]
+  porto:          [  -8.70,  41.10,  -8.55,   41.25]
+  athens:         [  23.68,  37.96,  23.76,   38.00]
+  beijing:        [ 116.05,  39.70,  116.75,  40.15]
   san_francisco:  [-122.52,  37.70, -122.33,  37.83]
   new_york:       [ -74.05,  40.60,  -73.90,  40.92]
   rome:           [  12.35,  41.80,   12.62,  41.98]
+  hanoi:          [ 105.22,  20.50,  106.15,  21.45]

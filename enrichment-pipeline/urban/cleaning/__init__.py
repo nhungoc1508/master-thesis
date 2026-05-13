@@ -6,11 +6,12 @@ from .geolife import GeoLifeCleaner
 from .cabspotting import CabspottingCleaner
 from .nyc_osm import NYCOSMCleaner
 from .rome import RomeCleaner
+from .hanoi import HanoiCleaner
 from .sampling import grid_sample_ids
 
 __all__ = [
     'BaseCleaner', 'CANONICAL_SCHEMA', 'QualityConfig',
     'PortoCleaner', 'PNEUMACleaner', 'TDriveCleaner', 'GeoLifeCleaner',
-    'CabspottingCleaner', 'NYCOSMCleaner', 'RomeCleaner',
+    'CabspottingCleaner', 'NYCOSMCleaner', 'RomeCleaner', 'HanoiCleaner',
     'grid_sample_ids'
 ]
