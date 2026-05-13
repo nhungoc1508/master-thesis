@@ -40,6 +40,7 @@ import pyarrow.parquet as pq
 from cleaning import (
     PortoCleaner, PNEUMACleaner, TDriveCleaner, GeoLifeCleaner,
     CabspottingCleaner, NYCOSMCleaner, RomeCleaner, HanoiCleaner,
+    BrusselsCleaner,
     grid_sample_ids
 )
 
@@ -56,6 +57,7 @@ CLEANERS = {
     'nyc_osm': NYCOSMCleaner,
     'rome': RomeCleaner,
     'hanoi': HanoiCleaner,
+    'brussels': BrusselsCleaner
 }
 
 def _filter_parquet_by_ids(input_path: Path, output_path: Path, ids: set[str]) -> int:

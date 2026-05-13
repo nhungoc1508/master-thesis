@@ -7,11 +7,13 @@ from .cabspotting import CabspottingCleaner
 from .nyc_osm import NYCOSMCleaner
 from .rome import RomeCleaner
 from .hanoi import HanoiCleaner
+from .brussels import BrusselsCleaner
 from .sampling import grid_sample_ids
 
 __all__ = [
     'BaseCleaner', 'CANONICAL_SCHEMA', 'QualityConfig',
     'PortoCleaner', 'PNEUMACleaner', 'TDriveCleaner', 'GeoLifeCleaner',
     'CabspottingCleaner', 'NYCOSMCleaner', 'RomeCleaner', 'HanoiCleaner',
+    'BrusselsCleaner',
     'grid_sample_ids'
 ]

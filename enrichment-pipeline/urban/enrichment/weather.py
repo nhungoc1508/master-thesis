@@ -55,6 +55,7 @@ CITY_WEATHER_COORDS: dict[str, tuple[float, float]] = {
     "new_york":      (40.71,  -74.01),
     "rome":          (41.90,   12.50),
     "hanoi":         (21.03, 105.85),
+    "brussels":      (50.85, 4.35),
 }
 
 # Mapping from WMO codes to readable strings

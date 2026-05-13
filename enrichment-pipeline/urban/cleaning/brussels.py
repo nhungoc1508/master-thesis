@@ -1,12 +1,12 @@
 """
-BerlinMOD-Hanoi cleaner
+BerlinMOD-Brussels cleaner
 
 Raw format: .parquet file (pre-cleaned in DuckDB) with columns
     tripid, lat, lon, ts
 
 Implementation details:
-    - Very densely sampled (median ~3 Hz)
-    - Resample each trip to ~0.125 Hz using greedy selection: a point is kept
+    - Very densely sampled
+    - Resample each trip to ~0.2 Hz using greedy selection: a point is kept
         if it is >= _RESAMPLE_DT seconds after the last kept point
     - Synthetic data so no need to filter GPS noise
 """
@@ -23,7 +23,7 @@ from .base import BaseCleaner, QualityConfig
 
 logger = logging.getLogger(__name__)
 
-_RESAMPLE_DT = 8.0 # resample to ~ 0.125 Hz
+_RESAMPLE_DT = 5.0 # resample to ~ 0.2 Hz
 _FETCH_CHUNK = 500_000
 
 def _resample_trajectory(ts: np.ndarray, lats: np.ndarray, lons: np.ndarray):
@@ -39,9 +39,9 @@ def _resample_trajectory(ts: np.ndarray, lats: np.ndarray, lons: np.ndarray):
             last = ts[i]
     return ts[keep], lats[keep], lons[keep]
 
-class HanoiCleaner(BaseCleaner):
-    source         = 'berlinmod_hanoi'
-    city           = 'hanoi'
+class BrusselsCleaner(BaseCleaner):
+    source         = 'berlinmod_brussels'
+    city           = 'brussels'
     transport_mode = 'car'
 
     def __init__(self, config: QualityConfig | None = None):
@@ -81,7 +81,7 @@ class HanoiCleaner(BaseCleaner):
     def _make_traj(tripid: int, ts_list: list[float], lat_list: list[float], lon_list: list[float]) -> dict:
         ts_r, lat_r, lon_r = _resample_trajectory(np.array(ts_list), np.array(lat_list), np.array(lon_list))
         return {
-            'trajectory_id': f'berlinmod_hanoi_{tripid}',
+            'trajectory_id': f'berlinmod_brussels_{tripid}',
             'lats': lat_r.tolist(),
             'lons': lon_r.tolist(),
             'timestamps': ts_r.astype(np.int64).tolist()
