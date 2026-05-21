@@ -25,7 +25,7 @@ def run(input_txt: Path | str, vessel_info_csv: Path | str,
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    output_csv = output_dir / f'{input_txt.stem.replace("_for_annitation", "")}_annotated.csv'
+    output_csv = output_dir / f'{input_txt.stem.replace("_for_annotation", "")}_annotated.csv'
     
     arch_cfg = cfg['archimedes']
     anno_cfg = cfg.get('annotate', {})

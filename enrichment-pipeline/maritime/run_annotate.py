@@ -6,9 +6,9 @@ Original repository: https://github.com/M3-Archimedes/AIS-trajectory-annotation
 Requires the binary to be complied first
 
 Usage examples:
-    python run_annotate.py \\
-        data/ingested/aisdk-2025-01-01_for_annotation.txt \\ # sorted .txt file
-        data/ingested/aisdk-2025-01-01_vessel_info.csv       # vessel info .csv
+    python run_annotate.py \
+        data/ingested/aisdk-2025-01-01_for_annotation.txt \ # sorted .txt file
+        data/ingested/aisdk-2025-01-01_vessel_info.csv      # vessel info .csv
 """
 import argparse
 import logging
