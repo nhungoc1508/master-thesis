@@ -1,0 +1,86 @@
+archimedes:
+  annotation_binary: /home/ubuntu/thesis/Archimedes-new/AIS-trajectory-annotation/src/annotate
+  python_src: /home/ubuntu/thesis/Archimedes-new/AIS-semantic-trajectories/src
+  params_json: /home/ubuntu/thesis/Archimedes-new/AIS-trajectory-annotation/test/settings/params.json
+
+ingest:
+  mobile_type_filter: ['Class A', 'Class B']
+  forward_fill_cols:
+    - Name
+    - Ship type
+    - Draught
+    - Length
+    - Width
+    - Destination
+    - ETA
+  raw_columns:
+    mmsi:        MMSI
+    timestamp:   "# Timestamp"
+    lat:         Latitude
+    lon:         Longitude
+    sog:         SOG
+    cog:         COG
+    heading:     Heading
+    rot:         ROT
+    nav_status:  Navigational status
+    ship_type:   Ship type
+    draught:     Draught
+    name:        Name
+    destination: Destination
+    eta:         ETA
+    length:      Length
+    width:       Width
+    mobile_type: Type of mobile
+
+annotate:
+  annotated_only: false
+  id_col: 1
+  ts_col: 4
+
+segment:
+  min_gap_size: 3600
+  min_points: 20
+  min_duration_s: 300          # 5 minutes
+  min_displacement_nm: 0.5     # 0.5 nautical miles
+
+enrich:
+  stop_speed_kn: 0.5
+  slow_speed_kn: 3.0
+
+  context:
+    # World Port Index CSV: columns LON, LAT, NAME
+    ports_csv: data/context/ports.csv
+    # OSM island/cape/strait/peninsula shapefiles
+    placemarks_shp: data/context/osm_places.shp
+    capes_shp: data/context/osm_capes.shp
+    # OSM protection zones (Marine Protected Areas)
+    protected_areas_shp: data/context/osm_protected_areas.shp
+    # OSM Traffic Separation Schemes
+    separation_zones_shp: data/context/osm_separation.shp
+    # OSM harbour area polygons
+    harbour_polygons_shp: data/context/osm_harbours.shp
+    # VLIZ World EEZ v12 GeoPackage
+    eez_gpkg: data/context/World_EEZ_v12_20231025_gpkg/eez_v12.gpkg
+    # VLIZ IHO Sea Areas shapefile
+    sea_areas_shp: data/context/World_Seas_IHO_v3/World_Seas_IHO_v3.shp
+    # GEBCO 2024 bathymetry NetCDF
+    gebco_nc_dir: data/context/gebco/
+
+  port_proximity:
+    berthed_nm: 0.5      # within 0.5 NM + inside harbour polygon -> berthed
+    approach_nm: 5.0     # within 5 NM of WPI centroid -> port_approach
+    coastal_nm: 20.0     # within 20 NM -> coastal; beyond -> offshore
+
+  # Ocean enrichment via copernicusmarine
+  ocean:
+    wave_dataset: cmems_mod_glo_wav_anfc_0.083deg_PT3H-i
+    wave_variable: VHM0
+    current_dataset: cmems_mod_glo_phy_anfc_0.083deg_P1H-m
+    current_variables: [uo, vo]
+    cache_dir: data/ocean_cache/
+    batch_days: 7
+    bbox_buffer_deg: 1.0
+
+canonicalize:
+  # Resample to one point per interval using floor-bucket selection
+  interval_s: 300
