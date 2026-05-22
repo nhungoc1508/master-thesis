@@ -83,4 +83,4 @@ enrich:
 
 canonicalize:
   # Resample to one point per interval using floor-bucket selection
-  interval_s: 300
+  interval_s: 60 # 1 minute
