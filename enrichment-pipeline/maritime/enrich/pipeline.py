@@ -24,10 +24,11 @@ import pyarrow.parquet as pq
 from utils.archimedes import setup_path, load_context
 from enrich import temporal, kinematic
 from enrich.spatial import SpatialEnricher
+from enrich.bathymetry import BathymetryEnricher
 
 logger = logging.getLogger(__name__)
 
-_ALL_STAGES = ['spatial', 'temporal', 'kinematic']
+_ALL_STAGES = ['spatial', 'temporal', 'kinematic', 'bathymetry']
 
 def _checkpoint_path(output_dir: Path, stem: str, stage: str) -> Path:
     return output_dir / f'{stem}_checkpoint_{stage}.parquet'
@@ -69,6 +70,7 @@ def run(segmented_parquet: Path | str, output_dir: Path | str,
     port_cfg = enrich_cfg.get('port_proximity', {})
     context_cfg = enrich_cfg.get('context', {})
     spatial_enr = SpatialEnricher(context, port_cfg, context_cfg)
+    batho_enr = BathymetryEnricher(context.get('bytho_netcdf'))
     stop_kn = float(enrich_cfg.get('stop_speed_kn', 0.5))
     slow_kn = float(enrich_cfg.get('slow_speed_kn', 3.0))
 
@@ -89,7 +91,8 @@ def run(segmented_parquet: Path | str, output_dir: Path | str,
     stage_funcs = {
         'spatial': lambda d: spatial_enr.enrich(d),
         'temporal': lambda d: temporal.enrich(d),
-        'kinematic': lambda d: kinematic.enrich(d, stop_kn, slow_kn)
+        'kinematic': lambda d: kinematic.enrich(d, stop_kn, slow_kn),
+        'bathymetry': lambda d: batho_enr.enrich(d)
     }
 
     for idx, stage in enumerate(_ALL_STAGES):

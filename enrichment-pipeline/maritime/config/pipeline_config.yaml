@@ -63,7 +63,7 @@ enrich:
     eez_gpkg: data/context/World_EEZ_v12_20231025_gpkg/eez_v12.gpkg
     # VLIZ IHO Sea Areas shapefile
     sea_areas_shp: data/context/World_Seas_IHO_v3/World_Seas_IHO_v3.shp
-    # GEBCO 2024 bathymetry NetCDF
+    # GEBCO 2026 bathymetry NetCDF
     gebco_nc_dir: data/context/gebco/
 
   port_proximity:
