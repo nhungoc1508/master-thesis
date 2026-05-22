@@ -4,10 +4,10 @@ Enrichment pipeline central orchestrator
 Reads a segmented .parquet file (one row per GPS point) then runs enrichment stages
 Writes a checkpoint after each stage so the pipeline can be resumed
 
-Stages:
+Stages (in this order):
+    spatial         World Port Index, OSM shapefiles (habors, MPA, TSS), VLIZ EEZ, VLIZ IHO sea areas
     temporal        temporal features derived from timestamp
     kinematic       derived from original AIS features (SOG, Heading, COG) and annotation labe;s
-    spatial         World Port Index, OSM shapefiles (habors, MPA, TSS), VLIZ EEZ, VLIZ IHO sea areas
     bathymetry      GEBCO NetCDF
     ocean           Copernicus CMEMS API
     geohash         computed
@@ -22,11 +22,12 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from utils.archimedes import setup_path, load_context
+from enrich import temporal
 from enrich.spatial import SpatialEnricher
 
 logger = logging.getLogger(__name__)
 
-_ALL_STAGES = ['spatial']
+_ALL_STAGES = ['spatial', 'temporal']
 
 def _checkpoint_path(output_dir: Path, stem: str, stage: str) -> Path:
     return output_dir / f'{stem}_checkpoint_{stage}.parquet'
@@ -84,13 +85,14 @@ def run(segmented_parquet: Path | str, output_dir: Path | str,
 
     # ========== Run stages ==========
     stage_funcs = {
+        'temporal': lambda d: temporal.enrich(d),
         'spatial': lambda d: spatial_enr.enrich(d)
     }
 
     for idx, stage in enumerate(_ALL_STAGES):
         if idx < start_from or stage not in stages:
             continue
-        logger.info('Enrichment stage: %s (%d rows)', stage, len(df))
+        logger.info('----- Enrichment stage: %s (%d rows) -----', stage, len(df))
         df = stage_funcs[stage](df)
         _save_checkpoint(df, _checkpoint_path(output_dir, stem, stage))
 

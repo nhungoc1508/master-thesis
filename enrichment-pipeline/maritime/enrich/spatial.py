@@ -225,7 +225,7 @@ class SpatialEnricher:
                              if c in self._eez_gdf.columns]
                 joined = _sjoin_within(self._eez_gdf[['geometry'] + eez_extra])
                 hits = joined.dropna(subset=['index_right'])
-                pots = hits['_pos'].values.astype(int)
+                pos = hits['_pos'].values.astype(int)
                 if 'ISO_SOV1' in hits.columns:
                     iso_vals = hits['ISO_SOV1'].fillna('').str[:3].values
                 elif 'SOVEREIGN1' in hits.columns:
