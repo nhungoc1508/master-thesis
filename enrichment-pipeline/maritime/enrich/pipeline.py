@@ -22,14 +22,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from utils.archimedes import setup_path, load_context
-from enrich import temporal, kinematic
+from enrich import temporal, kinematic, geohash_enc
 from enrich.spatial import SpatialEnricher
 from enrich.bathymetry import BathymetryEnricher
 from enrich.ocean import OceanEnricher
 
 logger = logging.getLogger(__name__)
 
-_ALL_STAGES = ['spatial', 'temporal', 'kinematic', 'bathymetry', 'ocean']
+_ALL_STAGES = ['spatial', 'temporal', 'kinematic', 'bathymetry', 'ocean', 'geohash']
 
 def _checkpoint_path(output_dir: Path, stem: str, stage: str) -> Path:
     return output_dir / f'{stem}_checkpoint_{stage}.parquet'
@@ -95,7 +95,8 @@ def run(segmented_parquet: Path | str, output_dir: Path | str,
         'temporal': lambda d: temporal.enrich(d),
         'kinematic': lambda d: kinematic.enrich(d, stop_kn, slow_kn),
         'bathymetry': lambda d: batho_enr.enrich(d),
-        'ocean': lambda d: ocean_enr.enrich(d)
+        'ocean': lambda d: ocean_enr.enrich(d),
+        'geohash': lambda d: geohash_enc.enrich(d)
     }
 
     for idx, stage in enumerate(_ALL_STAGES):
