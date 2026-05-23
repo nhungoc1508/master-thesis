@@ -30,7 +30,7 @@ from template.descriptor import generate_point_descriptor
 
 def describe_file(input_path: Path, output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / f'{input_path.stem}_described.parquet'
+    out_path = output_dir / f'{input_path.stem.replace("_canonical", "")}_described.parquet'
     
     pf = pq.ParquetFile(input_path)
     writer = None

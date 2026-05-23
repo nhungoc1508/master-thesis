@@ -73,7 +73,7 @@ def _slot_corridor(r: dict) -> str:
 def _slot_infrastructure(r: dict) -> str:
     label = _safe_get_val(r, 'port_proximity_label', 'offshore')
     name = _safe_get_val(r, 'nearest_port_name')
-    nm = _safe_get_val(r, 'nearest_port_nm')
+    nm = _safe_get_val(r, 'nearest_port_nm', None)
     if nm is not None and name:
         return f'[INFRASTRUCTURE]: {label}, closest to port {name} ({float(nm):.1f} nm).'
     return f'[INFRASTRUCTURE]: {label}, closest to port {name}.'
