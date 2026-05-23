@@ -1,0 +1,14 @@
+duckdb
+geopandas
+haversine
+pygeohash
+pyarrow
+pandas
+numpy
+xarray
+pyyaml
+copernicusmarine
+shapely
+fastdtw
+scipy
+transliterate
