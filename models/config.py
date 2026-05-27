@@ -1,0 +1,38 @@
+from __future__ import annotations
+from dataclasses import dataclass, field
+
+@dataclass
+class ModelConfig:
+    input_dim: int = 6 # [d_lat, d_lon, d_t, speed_n, heading_n, turn_n]
+    d_model: int = 128
+    n_heads: int = 4
+    n_layers: int = 4
+    ffn_dim: int = 512
+    dropout: float = 0.1
+    max_len: int = 256
+    fourier_embed_dim: int = 64
+    sem_dim: int = 256
+    use_semantics: bool = True
+    no_sem_token: bool = True
+    n_domains: int = 2
+    
+    epochs: int = 50
+    sem_pred_alpha: float = 0.05
+
+    batch_size: int = 128
+    lr: float = 1e-3
+    lr_min: float = 1e-5
+    weight_decay: float = 1e-4
+    patience: int = 10
+
+    urban_train_parquets: list[str] = field(default_factory=list)
+    urban_val_parquets: list[str] = field(default_factory=list)
+    maritime_train_parquets: list[str] = field(default_factory=list)
+    maritime_val_parquets: list[str] = field(default_factory=list)
+    urban_train_sem_npy: list[str] = field(default_factory=list)
+    urban_val_sem_npy: list[str] = field(default_factory=list)
+    maritime_train_sem_npy: list[str] = field(default_factory=list)
+    maritime_val_sem_npy: list[str] = field(default_factory=list)
+
+    checkpoint_dir: str = 'checkpoints/'
+    log_every: int = 100
