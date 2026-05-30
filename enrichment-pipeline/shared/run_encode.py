@@ -56,7 +56,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from template.encoder import SemanticEncoder
+from encoder import SemanticEncoder
 
 _READ_CHUNK = 20_000
 
