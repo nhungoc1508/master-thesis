@@ -358,9 +358,10 @@ def train(cfg: ModelConfig, args: argparse.Namespace) -> None:
         if val_rec < best_val:
             best_val = val_rec
             patience_count = 0
+            import dataclasses
             torch.save(
                 {'epoch': epoch, 'model': model.state_dict(),
-                 'val_rec': best_val, 'cfg': cfg},
+                 'val_rec': best_val, 'cfg': dataclasses.asdict(cfg)},
                  checkpoint_dir / 'best.pt'
             )
             logger.info('\tNew best model saved to %s', checkpoint_dir)
