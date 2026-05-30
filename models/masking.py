@@ -10,8 +10,8 @@ import numpy as np
 
 _MODES = ['spatial_random', 'block', 'key_point', 'kinematic_group', 'semantic_group', 'last_n']
 _PROBS = {
-    'urban': [0.25, 0.20, 0.15, 0.05, 0.20, 0.15],
-    'maritime': [0.20, 0.35, 0.10, 0.15, 0.10, 0.10]
+    'urban': [0.25, 0.20, 0.15, 0.15, 0.05, 0.20],
+    'maritime': [0.25, 0.20, 0.15, 0.15, 0.05, 0.20]
 }
 
 def random_mask(n: int, r: float = 0.5, rng: np.random.Generator | None = None) -> np.ndarray:

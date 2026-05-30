@@ -236,6 +236,8 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         self.E_dom = nn.Embedding(cfg.n_domains, d)
 
         # [KIN_UNK] token: replace 3 kinematic features when masked/unavailable
+        # Masking scenario 1: pos_mask -> along with spatial, temporal, domain ID
+        # Masking scenario 2: kin_group_masked = True
         self.kin_unk = nn.Parameter(torch.zeros(3))
 
         # Input projection from 6-D
@@ -256,7 +258,14 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         else:
             self.g = None
         if cfg.no_sem_token:
+            # [NO_SEM] token: replace semantic embedding when masked/unavailable
+            # Masking scenario 1: no semantics available
+            # Masking scenario 2: sem_group_masked = True
+            # Masking scenario 3: pos_mask -> semantics need to be masked before cross attention
             self.no_sem = nn.Parameter(torch.zeros(cfg.sem_dim))
+        
+        # RoPE: [MASK_COORD] token to replace coords when whole point is masked
+        self.mask_coords = nn.Parameter(torch.zeros(2))
         
         # Contrastive components
         # self.W_traj_sem = nn.Linear(d, d, bias=False)
@@ -348,16 +357,24 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         # Target: [Δlat, Δlon, Δt_norm, speed_n, heading_n, turn_n]
         target = torch.cat([x_spatial, tau[..., 3:4], kinematics], dim=-1)
 
+        # Mask kinematic group if needed
         kin = self._apply_kin_unk(kinematics, kin_group_masked)
         e = self._embed(x_spatial, tau, kin, domain_ids)
 
         if pos_mask is not None:
+            # Mask whole position (spatial - tau - kin - domain)
             mask_tok = self.mask_token.view(1, 1, -1).expand(B, L, -1)
             e = torch.where(pos_mask.unsqueeze(-1), mask_tok, e)
+            # Mask coordinates (for RoPE)
+            mask_coords_tok = self.mask_coords.view(1, 1, 2).expand(B, L, 2)
+            coords_input = torch.where(pos_mask.unsqueeze(-1), mask_coords_tok, coords)
+        else:
+            # If not masked, coords remains visible
+            coords_input = coords
 
         z = e
         for layer in self.layers:
-            z = layer(z, coords, domain_ids, pad_mask=pad_mask)
+            z = layer(z, coords_input, domain_ids, pad_mask=pad_mask)
         z = self.norm(z)
 
         if self.g is not None:
@@ -408,20 +425,24 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
 
         When kin_group_masked=True:
           - All kinematic features are replaced with [KIN_UNK] (handled by
-            V3's _apply_kin_unk before the embeddings are built).
+            _apply_kin_unk before the embeddings are built).
         """
         B, L = x_spatial.shape[:2]
 
         # Resolve semantic input for g
         if sem_group_masked or e_sem is None:
-            e_sem_use: torch.Tensor | None = (
-                self.no_sem.view(1, 1, -1).expand(B, L, -1)
-                if hasattr(self, 'no_sem') else None
-            )
+            if hasattr(self, 'no_sem'):
+                e_sem_use = self.no_sem.view(1, 1, -1).expand(B, L, -1)
+            else:
+                e_sem_use = None
         else:
             e_sem_use = e_sem
+            # Mask semantics depending on pos_mask
+            if pos_mask is not None and hasattr(self, 'no_sem'):
+                no_sem_tok = self.no_sem.view(1, 1, -1).expand(B, L, -1)
+                e_sem_use = torch.where(pos_mask.unsqueeze(-1), no_sem_tok, e_sem_use)
 
-        # Full V3 forward (handles spatial masking, kin_unk, g cross-attention)
+        # Full _forward (handles spatial masking, kin_unk, g cross-attention)
         out = self._forward(
             x_spatial, tau, kinematics, coords, pad_mask, pos_mask,
             domain_ids, e_sem_use, kin_group_masked,
