@@ -340,66 +340,6 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         pad_mask = kwargs.get('pad_mask', args[4])
         valid = (~pad_mask).float().unsqueeze(-1)
         return (z * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
-
-    def _forward(
-        self,
-        x_spatial: torch.Tensor,
-        tau: torch.Tensor,
-        kinematics: torch.Tensor,
-        coords: torch.Tensor,
-        pad_mask: torch.Tensor,
-        pos_mask: torch.Tensor | None,
-        domain_ids: torch.Tensor,
-        e_sem: torch.Tensor | None = None,
-        kin_group_masked: bool = False,
-    ) -> dict:
-        B, L, _ = x_spatial.shape
-        # Target: [Δlat, Δlon, Δt_norm, speed_n, heading_n, turn_n]
-        target = torch.cat([x_spatial, tau[..., 3:4], kinematics], dim=-1)
-
-        # Mask kinematic group if needed
-        kin = self._apply_kin_unk(kinematics, kin_group_masked)
-        e = self._embed(x_spatial, tau, kin, domain_ids)
-
-        if pos_mask is not None:
-            # Mask whole position (spatial - tau - kin - domain)
-            mask_tok = self.mask_token.view(1, 1, -1).expand(B, L, -1)
-            e = torch.where(pos_mask.unsqueeze(-1), mask_tok, e)
-            # Mask coordinates (for RoPE)
-            mask_coords_tok = self.mask_coords.view(1, 1, 2).expand(B, L, 2)
-            coords_input = torch.where(pos_mask.unsqueeze(-1), mask_coords_tok, coords)
-        else:
-            # If not masked, coords remains visible
-            coords_input = coords
-
-        z = e
-        for layer in self.layers:
-            z = layer(z, coords_input, domain_ids, pad_mask=pad_mask)
-        z = self.norm(z)
-
-        if self.g is not None:
-            if e_sem is None and hasattr(self, 'no_sem'):
-                e_sem_use = self.no_sem.view(1, 1, -1).expand(B, L, -1)
-            else:
-                e_sem_use = e_sem
-            if e_sem_use is not None:
-                h = self.g(z, e_sem_use, pad_mask=pad_mask)
-            else:
-                h = z
-        else:
-            h = z
-
-        pred = self.output_head(h)
-
-        out = {'pred': pred, 'z': z, 'h': h}
-        if pos_mask is not None:
-            real_masked = pos_mask & ~pad_mask
-            if real_masked.any():
-                out['loss'] = ((pred[real_masked] - target[real_masked]) ** 2).mean()
-            else:
-                out['loss'] = torch.tensor(0.0, device=x_spatial.device)
-
-        return out
     
     def forward(
         self,
@@ -442,11 +382,47 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
                 no_sem_tok = self.no_sem.view(1, 1, -1).expand(B, L, -1)
                 e_sem_use = torch.where(pos_mask.unsqueeze(-1), no_sem_tok, e_sem_use)
 
-        # Full _forward (handles spatial masking, kin_unk, g cross-attention)
-        out = self._forward(
-            x_spatial, tau, kinematics, coords, pad_mask, pos_mask,
-            domain_ids, e_sem_use, kin_group_masked,
-        )
+        # Full forward (handles spatial masking, kin_unk, g cross-attention)
+
+        # Target: [Δlat, Δlon, Δt_norm, speed_n, heading_n, turn_n]
+        target = torch.cat([x_spatial, tau[..., 3:4], kinematics], dim=-1)
+        # Mask kinematic group if needed
+        kin = self._apply_kin_unk(kinematics, kin_group_masked)
+        e = self._embed(x_spatial, tau, kin, domain_ids)
+        
+        if pos_mask is not None:
+            # Mask whole position (spatial - tau - kin - domain)
+            mask_tok = self.mask_token.view(1, 1, -1).expand(B, L, -1)
+            e = torch.where(pos_mask.unsqueeze(-1), mask_tok, e)
+            # Mask coordinates (for RoPE)
+            mask_coords_tok = self.mask_coords.view(1, 1, 2).expand(B, L, 2)
+            coords_input = torch.where(pos_mask.unsqueeze(-1), mask_coords_tok, coords)
+        else:
+            # If not masked, coords remains visible
+            coords_input = coords
+
+        z = e
+        for layer in self.layers:
+            z = layer(z, coords_input, domain_ids, pad_mask=pad_mask)
+        z = self.norm(z)
+
+        if self.g is not None:
+            if e_sem_use is not None:
+                h = self.g(z, e_sem_use, pad_mask=pad_mask)
+            else:
+                h = z
+        else:
+            h = z
+
+        pred = self.output_head(h)
+
+        out = {'pred': pred, 'z': z, 'h': h}
+        if pos_mask is not None:
+            real_masked = pos_mask & ~pad_mask
+            if real_masked.any():
+                out['loss'] = ((pred[real_masked] - target[real_masked]) ** 2).mean()
+            else:
+                out['loss'] = torch.tensor(0.0, device=x_spatial.device)
 
         loss_recovery = out['loss']
         loss_sem_pred = torch.tensor(0.0, device=x_spatial.device)
