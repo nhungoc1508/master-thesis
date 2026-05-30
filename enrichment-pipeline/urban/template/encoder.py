@@ -1,19 +1,14 @@
 """
 Frozen-weight text encoder for encoding per-point semantic description
 
-Default: use BAAI/bge-m3
-    - https://huggingface.co/BAAI/bge-m3
-    - https://ollama.com/library/bge-m3
-    - Multilingual, 1024D
-
-Alternative: jinaai/jina-embeddings-v3
-    - https://huggingface.co/jinaai/jina-embeddings-v3
+Default: use google/embeddinggemma-300m
+    - https://huggingface.co/google/embeddinggemma-300m
+    - https://ai.google.dev/gemma/docs/embeddinggemma
     - Multilingual, 1024D
     - Supports Matryoshka Representation Learning for truncating embeddings
 
 Usage:
-    encoder = SemanticEncoder() # bge-m3, full 1024D
-    encoder = SemanticEncoder('jinaai/jina-embeddings-v3', truncate_dim=256) # jina-v3, native Matryoshka
+    encoder = SemanticEncoder()
     embeddings = encoder.encode([sentence, sentence, ...])
     -> returns: np.ndarray, shape (N, embed_dim), dtype float16
 """
@@ -27,12 +22,13 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = 'jinaai/jina-embeddings-v3'
+DEFAULT_MODEL = 'google/embeddinggemma-300m'
 EMBED_DIM = 1024
 MATRYOSHKA_MODELS = {
     'jinaai/jina-embeddings-v3',
     'nomic-ai/nomic-embed-text-v1.5',
-    'embeddinggemma-300m'
+    'google/embeddinggemma-300m',
+    'google/embeddinggemma-1b',
 }
 
 class SemanticEncoder:
@@ -44,17 +40,22 @@ class SemanticEncoder:
         normalize: bool = True,
         max_seq_length: int = 512,
         truncate_dim: Optional[int] = None,
-        trust_remote_code: bool = False
+        trust_remote_code: bool = False,
+        attn_implementation: Optional[str] = None,
     ):
         """
         Params:
-            model_name:         HuggingFace model ID, default: 'jinaai/jina-embeddings-v3'
-            device:             'cpu' or 'cuda', default None (auto-detect)
-            batch_size:         encoding batch size, default 1024
-            normalize:          L2-normalize embeddings
-            max_seq_length:     truncate descriptions longer than this threshold
-            truncate_dim:       # of first output dimensions to keep for Matryoshka models
-            trust_remote_code:  required for some models
+            model_name:           HuggingFace model ID, default: 'google/embeddinggemma-300m'
+            device:               'cpu' or 'cuda', default None (auto-detect)
+            batch_size:           encoding batch size, default 1024
+            normalize:            L2-normalize embeddings
+            max_seq_length:       truncate descriptions longer than this threshold
+            truncate_dim:         # of first output dimensions to keep for Matryoshka models
+            trust_remote_code:    required for some models
+            attn_implementation:  'sdpa' (PyTorch 2.0+ native, no install needed) or
+                                  'flash_attention_2' (requires: pip install flash-attn).
+                                  Both reduce memory pressure; flash_attention_2 is fastest
+                                  on H100/A100 and enables larger batch sizes.
         """
         if device is None:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -64,26 +65,31 @@ class SemanticEncoder:
         self.model_name = model_name
         self.truncate_dim = truncate_dim
 
-        use_fp16 = device.startswith('cuda')
-        logger.info('Loading %s on %s (fp16=%s, truncate+dim=%s)',
-                    model_name, device, use_fp16, truncate_dim)
+        on_cuda = device.startswith('cuda')
+        logger.info('Loading %s on %s (bf16=%s, truncate_dim=%s, attn=%s)',
+                    model_name, device, on_cuda, truncate_dim, attn_implementation)
+
+        model_kwargs: dict = {}
+        if on_cuda:
+            model_kwargs['dtype'] = torch.bfloat16
+        # Default to 'eager' (pure PyTorch)
+        model_kwargs['attn_implementation'] = attn_implementation or 'eager'
 
         self._model = SentenceTransformer(
             model_name,
-            device = device,
-            trust_remote_code = trust_remote_code,
-            truncate_dim = truncate_dim,
-            model_kwargs = {'torch_dtype': torch.float16} if use_fp16 else {}
+            device=device,
+            trust_remote_code=trust_remote_code,
+            truncate_dim=truncate_dim,
+            model_kwargs=model_kwargs,
         )
         self._model.max_seq_length = max_seq_length
 
-        # Freeze weights
         for p in self._model.parameters():
             p.requires_grad_(False)
-
         self._model.eval()
-        logger.info('Encoder ready: dim=%d, max_seq=%d, fp16=%s',
-                    self.embed_dim, max_seq_length, use_fp16)
+
+        logger.info('Encoder ready: dim=%d, max_seq=%d, bf16=%s',
+                    self.embed_dim, max_seq_length, on_cuda)
     
     @property
     def embed_dim(self) -> int:
@@ -102,9 +108,9 @@ class SemanticEncoder:
         with torch.no_grad():
             embs = self._model.encode(
                 texts,
-                batch_size = self.batch_size,
-                normalize_embeddings = self.normalize,
-                show_progress_bar = show_progress,
-                convert_to_numpy = True
+                batch_size=self.batch_size,
+                normalize_embeddings=self.normalize,
+                show_progress_bar=show_progress,
+                convert_to_numpy=True,
             )
         return embs.astype(np.float16)
