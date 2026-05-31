@@ -28,13 +28,12 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
+import dataclasses
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from data import TrajectoryDataset, collate_fn
 from masking import sample_mode, make_pos_mask
-# from v1.train import _temporal_features
-# from v3.train import _domain_ids, _kinematics_from_batch
 
 from config import ModelConfig
 from model import TrajectoryMaskedAutoEncoder
@@ -110,6 +109,184 @@ def _kinematics(batch: dict, device: torch.device) -> torch.Tensor:
     return torch.zeros(B, L, 3, device=device)
 
 # ========== Train/val loops ==========
+
+# Two-stage training
+
+def run_stage1(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val_loader: DataLoader,
+               cfg: ModelConfig, device: torch.device, checkpoint_dir: Path) -> None:
+    logger.info('===== Stage 1: Contrastive learning (%d epochs) =====', cfg.stage1_epochs)
+    optimizer = AdamW(list(model.parameters()), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, T_max=cfg.stage1_epochs, eta_min = cfg.lr_min)
+    step = 0
+    best_val = float('inf')
+
+    for epoch in range(1, cfg.stage1_epochs + 1):
+        model.train()
+        total_loss = 0.0
+        n_batches = 0
+        for batch in train_loader:
+            x_full = batch['x'].to(device)
+            x_spatial = x_full[..., :2]
+            tau = _temporal_features(batch, device)
+            kin = _kinematics(batch, device)
+            coords = batch['coords'].to(device)
+            pad_mask = batch['pad_mask'].to(device)
+            domain_ids = _domain_ids(batch, device)
+
+            e_sem = batch.get('e_sem')
+            if e_sem is None:
+                continue
+            e_sem = e_sem.to(device)
+
+            out = model.forward_stage1(x_spatial, tau, kin, coords, pad_mask, domain_ids, e_sem)
+            loss = out['loss']
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            total_loss += loss.item()
+            n_batches += 1
+            step += 1
+            if step % cfg.log_every == 0:
+                logger.info('\tStage 1: step=%d | loss=%.8f | tau=%.3f', step,
+                            loss.item(), model.log_tau.exp().item())
+                
+        model.eval()
+        val_loss = 0.0
+        n_val = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                x_full = batch['x'].to(device)
+                x_spatial = x_full[..., :2]
+                tau = _temporal_features(batch, device)
+                kin = _kinematics(batch, device)
+                coords = batch['coords'].to(device)
+                pad_mask = batch['pad_mask'].to(device)
+                domain_ids = _domain_ids(batch, device)
+                e_sem = batch.get('e_sem')
+                if e_sem is None:
+                    continue
+                e_sem = e_sem.to(device)
+                out = model.forward_stage1(x_spatial, tau, kin, coords, pad_mask, domain_ids, e_sem)
+                val_loss += out['loss'].item()
+                n_val += 1
+        val_loss /= max(n_val, 1)
+        scheduler.step()
+        logger.info('Stage 1: epoch %3d/%d | train=%.8f | val=%.8f', epoch, cfg.stage1_epochs,
+                    total_loss / max(n_batches, 1), val_loss)
+        if val_loss < best_val:
+            best_val = val_loss
+            torch.save(
+                {'epoch': epoch, 'model': model.state_dict(),
+                 'best_val': best_val, 'cfg': dataclasses.asdict(cfg)},
+                 checkpoint_dir / 'stage1_best.pt'
+            )
+            logger.info('\tNew best model saved to %s', checkpoint_dir)
+    
+    logger.info('Stage 1 complete; best val: %.8f', best_val)
+
+def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val_loader: DataLoader,
+               cfg: ModelConfig, device: torch.device, checkpoint_dir: Path,
+               rng: np.random.Generator) -> None:
+    logger.info('===== Stage 2: Masking-recovery + soft contrastive (%d epochs) =====', cfg.stage2_epochs)
+    optimizer = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = CosineAnnealingLR(optimizer, T_max=cfg.stage2_epochs, eta_min=cfg.lr_min)
+    step = 0
+    best_val = float('inf')
+    patience_count = 0
+
+    for epoch in range(1, cfg.stage2_epochs + 1):
+        model.train()
+        total_loss = 0.0
+        n_batches = 0
+        for batch in train_loader:
+            domain_str = _batch_domain_str(batch)
+            mode = sample_mode(domain_str, rng)
+
+            x_full = batch['x'].to(device)
+            x_spatial = x_full[..., :2]
+            tau = _temporal_features(batch, device)
+            kin = _kinematics(batch, device)
+            coords = batch['coords'].to(device)
+            pad_mask = batch['pad_mask'].to(device)
+            domain_ids = _domain_ids(batch, device)
+            pos_mask, kin_masked, _ = make_masks(batch, mode, cfg.max_len, device)
+            e_sem = batch.get('e_sem')
+            if e_sem is not None:
+                e_sem = e_sem.to(device)
+
+            # Detached semantic embedding for soft contrastive regulariser
+            e_traj_det = None
+            if e_sem is not None:
+                with torch.no_grad():
+                    e_traj_det = model.semantic_trajectory_embedding(e_sem, pad_mask)
+
+            out = model.forward_stage2(
+                x_spatial, tau, kin, coords, pad_mask, pos_mask, domain_ids,
+                e_sem, kin_masked, e_traj_det
+            )
+            loss = out['loss']
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            total_loss += loss.item()
+            n_batches += 1
+            step += 1
+            if step % cfg.log_every == 0:
+                logger.info('\tStage 2: step=%d | loss=%.8f | rec=%.8f | ctr=%.8f',
+                            step, loss.item(), out['loss_recovery'].item(),
+                            out['loss_contrastive'].item())
+
+        model.eval()
+        val_loss = 0.0
+        n_val = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                domain_str = _batch_domain_str(batch)
+                mode = sample_mode(domain_str, rng)
+
+                x_full = batch['x'].to(device)
+                x_spatial = x_full[..., :2]
+                tau = _temporal_features(batch, device)
+                kin = _kinematics(batch, device)
+                coords = batch['coords'].to(device)
+                pad_mask = batch['pad_mask'].to(device)
+                domain_ids = _domain_ids(batch, device)
+                pos_mask, kin_masked, _ = make_masks(batch, mode, cfg.max_len, device)
+                e_sem = batch.get('e_sem')
+                if e_sem is not None:
+                    e_sem = e_sem.to(device)
+                out = model.forward_stage2(
+                    x_spatial, tau, kin, coords, pad_mask, pos_mask, domain_ids,
+                    e_sem, kin_masked
+                )
+                val_loss += out['loss_recovery'].item()
+                n_val += 1
+
+        val_loss /= max(n_val, 1)
+        scheduler.step()
+        logger.info('Stage 2: epoch %3d/%d | train=%.8f | val_rec=%.8f',
+                    epoch, cfg.stage2_epochs, total_loss / max(n_batches, 1), val_loss)
+
+        if val_loss < best_val:
+            best_val = val_loss
+            patience_count = 0
+            torch.save(
+                {'epoch': epoch, 'model': model.state_dict(),
+                 'val_rec': best_val, 'cfg': dataclasses.asdict(cfg)},
+                 checkpoint_dir / 'best.pt'
+            )
+            logger.info('\tNew best model saved to %s', checkpoint_dir)
+        else:
+            patience_count += 1
+            if patience_count >= cfg.patience:
+                logger.info('Early stopping at epoch %d', epoch)
+                break
+
+    logger.info('Stage 2 completed; best val recovery loss: %.8f', best_val)
+
+# Original training
 
 def train_epoch(model: TrajectoryMaskedAutoEncoder, loader: DataLoader, optimizer: torch.optim.Optimizer,
                 device: torch.device, cfg: ModelConfig, step: int, rng: np.random.Generator)-> tuple[float, float, float, int]:
@@ -328,50 +505,58 @@ def train(cfg: ModelConfig, args: argparse.Namespace) -> None:
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info('Model: %s params  d_model=%d  n_layers=%d  n_heads=%d',
                 f'{n_params:,}', cfg.d_model, cfg.n_layers, cfg.n_heads)
-    logger.info('Training for %d epochs  lr=%.1e  batch_size=%d',
-                cfg.epochs, cfg.lr, cfg.batch_size)
+    # logger.info('Training for %d epochs  lr=%.1e  batch_size=%d',
+    #             cfg.epochs, cfg.lr, cfg.batch_size)
     
-    optimizer = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=cfg.lr_min)
+    # optimizer = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    # scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=cfg.lr_min)
 
     checkpoint_dir = Path(cfg.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     rng = np.random.default_rng()
-    best_val = float('inf')
-    patience_count = 0
-    step = 0
 
-    for epoch in range(1, cfg.epochs + 1):
-        train_loss, train_rec, train_sem, step = train_epoch(
-            model, train_loader, optimizer, device, cfg, step, rng
-        )
-        val_loss, val_rec = val_epoch(model, val_loader, device, cfg, rng)
-        scheduler.step()
+    # Two-stage training
+    logger.info('Training: stage1=%d epochs | stage2=%d epochs | lr=%.1e | batch_size=%d',
+                cfg.stage1_epochs, cfg.stage2_epochs, cfg.lr, cfg.batch_size)
+    run_stage1(model, train_loader, val_loader, cfg, device, checkpoint_dir)
+    run_stage2(model, train_loader, val_loader, cfg, device, checkpoint_dir, rng)
+    logger.info('Training complete. Best checkpoint: %s', checkpoint_dir / 'best.pt')
 
-        logger.info(
-            'Epoch %3d/%d | train=%.8f (rec=%.8f sem=%.8f) | val=%.8f (rec=%.8f) | lr=%.2e',
-            epoch, cfg.epochs, train_loss, train_rec, train_sem,
-            val_loss, val_rec, scheduler.get_last_lr()[0]
-        )
-
-        if val_rec < best_val:
-            best_val = val_rec
-            patience_count = 0
-            import dataclasses
-            torch.save(
-                {'epoch': epoch, 'model': model.state_dict(),
-                 'val_rec': best_val, 'cfg': dataclasses.asdict(cfg)},
-                 checkpoint_dir / 'best.pt'
-            )
-            logger.info('\tNew best model saved to %s', checkpoint_dir)
-        else:
-            patience_count += 1
-            if patience_count >= cfg.patience:
-                logger.info('Early stopping at epoch %d', epoch)
-                break
-    
-    logger.info('Model training complete. Best val recovery: %.8f', best_val)
+    # Single-stage training
+    # logger.info('Training for %d epochs  lr=%.1e  batch_size=%d',
+    #             cfg.epochs, cfg.lr, cfg.batch_size)
+    # optimizer = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    # scheduler = CosineAnnealingLR(optimizer, T_max=cfg.epochs, eta_min=cfg.lr_min)
+    # best_val = float('inf')
+    # patience_count = 0
+    # step = 0
+    # for epoch in range(1, cfg.epochs + 1):
+    #     train_loss, train_rec, train_sem, step = train_epoch(
+    #         model, train_loader, optimizer, device, cfg, step, rng
+    #     )
+    #     val_loss, val_rec = val_epoch(model, val_loader, device, cfg, rng)
+    #     scheduler.step()
+    #     logger.info(
+    #         'Epoch %3d/%d | train=%.8f (rec=%.8f sem=%.8f) | val=%.8f (rec=%.8f) | lr=%.2e',
+    #         epoch, cfg.epochs, train_loss, train_rec, train_sem,
+    #         val_loss, val_rec, scheduler.get_last_lr()[0]
+    #     )
+    #     if val_rec < best_val:
+    #         best_val = val_rec
+    #         patience_count = 0
+    #         torch.save(
+    #             {'epoch': epoch, 'model': model.state_dict(),
+    #              'val_rec': best_val, 'cfg': dataclasses.asdict(cfg)},
+    #              checkpoint_dir / 'best.pt'
+    #         )
+    #         logger.info('\tNew best model saved to %s', checkpoint_dir)
+    #     else:
+    #         patience_count += 1
+    #         if patience_count >= cfg.patience:
+    #             logger.info('Early stopping at epoch %d', epoch)
+    #             break
+    # logger.info('Model training complete. Best val recovery: %.8f', best_val)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -384,7 +569,9 @@ def main():
     parser.add_argument('--maritime-sem-npy', nargs='*', default=None)
     parser.add_argument('--maritime-val-sem-npy', nargs='*', default=None)
 
-    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--epochs', type=int, default=50)           # single-stage
+    parser.add_argument('--stage1-epochs', type=int, default=15)    # two-stage
+    parser.add_argument('--stage2-epochs', type=int, default=35)    # two-stage
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--d-model', type=int, default=128)
@@ -403,6 +590,8 @@ def main():
         sem_pred_alpha=args.alpha,
         use_semantics=not args.no_semantics,
         checkpoint_dir=args.checkpoint_dir,
+        stage1_epochs=args.stage1_epochs,
+        stage2_epochs=args.stage2_epochs,
         urban_train_sem_npy=args.urban_sem_npy or [],
         urban_val_sem_npy=args.urban_val_sem_npy or [],
         maritime_train_sem_npy=args.maritime_sem_npy or [],

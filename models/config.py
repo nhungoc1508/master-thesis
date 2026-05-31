@@ -16,8 +16,15 @@ class ModelConfig:
     no_sem_token: bool = True
     n_domains: int = 2
     
+    # Single-stage training with auxiliary semantic prediction head
     epochs: int = 50
     sem_pred_alpha: float = 0.05
+
+    # Two-stage training with contrastive learning
+    stage1_epochs: int = 15
+    stage2_epochs: int = 35
+    tau_init: float = 0.07
+    contrastive_lambda: float = 0.1
 
     batch_size: int = 128
     lr: float = 1e-3

@@ -65,6 +65,11 @@ class FourierTemporalEncoder(nn.Module):
         return self.proj(feats) # (B, L, out_dim)
     
 class STPEMultiheadAttention(nn.Module):
+    """
+    Multi-head attention with spatio-temporal rotary positional encoding applied
+    to rotate W_Q and W_K
+    """
+
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
         assert d_model % n_heads == 0
@@ -116,7 +121,10 @@ class STPEMultiheadAttention(nn.Module):
     
 class DomainAwareSTPELayer(nn.Module):
     """
-    
+    Transformer layer with spatio-temporal rotary positional encoding (STPE)
+    with per-domain spatial frequency offset
+
+    \phi_i = W_phi \cdot [x, y]^T + W_phi_dom[domain]
     """
 
     def __init__(self, d_model: int, n_heads: int, ffn_dim: int,
@@ -129,6 +137,7 @@ class DomainAwareSTPELayer(nn.Module):
 
         self.attn = STPEMultiheadAttention(d_model, n_heads, dropout)
 
+        # Per-domain spatial frequency bias
         self.W_phi_dom = nn.Embedding(n_domains, n_freqs)
         nn.init.zeros_(self.W_phi_dom.weight)
 
@@ -151,6 +160,7 @@ class DomainAwareSTPELayer(nn.Module):
         dom_offset = self.W_phi_dom(domain_ids)
         dom_coords_bias = dom_offset.unsqueeze(1).expand(B, L, n_freqs)
 
+        # Manually apply attention with domain-aware rotation
         x_norm = self.norm1(x)
         q = self.attn.W_q(x_norm).view(B, L, H, d_h).transpose(1, 2)
         k = self.attn.W_k(x_norm).view(B, L, H, d_h).transpose(1, 2)
@@ -159,6 +169,7 @@ class DomainAwareSTPELayer(nn.Module):
         k_idx = torch.arange(n_freqs, dtype=torch.float32, device=x.device)
         theta = 10000.0 ** (-2 * k_idx / d_h)
         
+        # Compute per-point spatial frequencies including domain offset
         phi_base = coords @ self.attn.W_phi.T
         phi = (phi_base + dom_coords_bias) * theta
 
@@ -218,7 +229,7 @@ class SemanticCrossAttention(nn.Module):
 
 class TrajectoryMaskedAutoEncoder(nn.Module):
     """
-    
+    Main model
     """
 
     def __init__(self, cfg: ModelConfig):
@@ -226,13 +237,13 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         self.cfg = cfg
         d = cfg.d_model
 
-        # Spatial embedding: [d_lat, d_lon]
+        # Spatial embedding: [d_lat, d_lon] -> d/2
         self.W_s = nn.Linear(2, d // 2, bias=False)
         
-        # Temporal embedding: 4-D tau
+        # Temporal embedding: 4-D tau -> d/2
         self.fourier_enc = FourierTemporalEncoder(4, cfg.fourier_embed_dim, d // 2)
 
-        # Domain embedding
+        # Domain embedding: 2-D -> d
         self.E_dom = nn.Embedding(cfg.n_domains, d)
 
         # [KIN_UNK] token: replace 3 kinematic features when masked/unavailable
@@ -268,8 +279,8 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         self.mask_coords = nn.Parameter(torch.zeros(2))
         
         # Contrastive components
-        # self.W_traj_sem = nn.Linear(d, d, bias=False)
-        # self.log_tau = nn.Parameter(torch.tensor(cfg.tau_init).log())
+        self.W_traj_sem = nn.Linear(d, d, bias=False)
+        self.log_tau = nn.Parameter(torch.tensor(cfg.tau_init).log())
 
         # Output head: d -> 6
         self.output_head = nn.Linear(d, cfg.input_dim)
@@ -280,8 +291,8 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         self._layer_norm_emb = nn.LayerNorm(d)
 
         # Auxiliary semantic prediction head (zero-initialised)
-        self.W_sem_pred = nn.Linear(cfg.d_model, cfg.sem_dim, bias=False)
-        nn.init.zeros_(self.W_sem_pred.weight)
+        # self.W_sem_pred = nn.Linear(cfg.d_model, cfg.sem_dim, bias=False)
+        # nn.init.zeros_(self.W_sem_pred.weight)
 
     def _embed(self, x_spatial: torch.Tensor, tau: torch.Tensor, kinematics: torch.Tensor,
                domain_ids: torch.Tensor) -> torch.Tensor:
@@ -357,7 +368,7 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         alpha: float = 0.05,
     ) -> dict:
         """
-        Single forward pass covering all six V5 masking modes.
+        Single forward pass covering all 6 masking modes.
 
         When sem_group_masked=True:
           - E_sem is replaced with the broadcast [NO_SEM] token before g.
@@ -424,20 +435,90 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
             else:
                 out['loss'] = torch.tensor(0.0, device=x_spatial.device)
 
+        # loss_recovery = out['loss']
+        # loss_sem_pred = torch.tensor(0.0, device=x_spatial.device)
+
+        # # Semantic alignment auxiliary loss (modes 1–4 only)
+        # if not sem_group_masked and e_sem_target is not None:
+        #     h = out['h']   # (B, L, d) — output of g (or encoder if g=None)
+        #     valid = (~pad_mask).float().unsqueeze(-1)              # (B, L, 1)
+        #     h_pool = (h * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)  # (B, d)
+        #     e_pred = self.W_sem_pred(h_pool)                       # (B, sem_dim)
+        #     loss_sem_pred = F.mse_loss(e_pred, e_sem_target)
+
+        # out['loss'] = loss_recovery + alpha * loss_sem_pred
+        # out['loss_recovery'] = loss_recovery
+        # out['loss_sem_pred'] = loss_sem_pred
+        return out
+    
+    def semantic_trajectory_embedding(self, e_sem: torch.Tensor,
+                                      pad_mask: torch.Tensor) -> torch.Tensor:
+        e = self.g.W_sem(e_sem)
+        valid = (~pad_mask).float().unsqueeze(-1)
+        pooled = (e * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
+        return self.W_traj_sem(pooled)
+    
+    def info_nce(self, z_traj: torch.Tensor, e_traj: torch.Tensor,
+                 detach_e: bool = False) -> torch.Tensor:
+        if detach_e:
+            e_traj = e_traj.detach()
+        z = F.normalize(z_traj, dim=-1)
+        e = F.normalize(e_traj, dim=-1)
+        tau = self.log_tau.exp().clamp(0.01, 1.0)
+        labels = torch.arange(z.size(0), device=z.device)
+        loss_ze = F.cross_entropy((z @ e.T) / tau, labels)
+        loss_ez = F.cross_entropy((e @ z.T) / tau, labels)
+        return (loss_ze + loss_ez) / 2.0
+    
+    def forward_stage1(
+            self,
+            x_spatial: torch.Tensor,
+            tau: torch.Tensor,
+            kinematics: torch.Tensor,
+            coords: torch.Tensor,
+            pad_mask: torch.Tensor,
+            domain_ids: torch.Tensor,
+            e_sem: torch.Tensor
+    ) -> dict:
+        """Contrastive learning (trajectory - semantic)"""
+        z_traj = self.trajectory_embedding(
+            x_spatial, tau, kinematics, coords, pad_mask, domain_ids, e_sem=None
+        )
+        e_traj = self.semantic_trajectory_embedding(e_sem, pad_mask)
+        loss = self.info_nce(z_traj, e_traj)
+        return {'loss': loss, 'z_traj': z_traj, 'e_traj': e_traj}
+    
+    def forward_stage2(
+            self,
+            x_spatial: torch.Tensor,
+            tau: torch.Tensor,
+            kinematics: torch.Tensor,
+            coords: torch.Tensor,
+            pad_mask: torch.Tensor,
+            pos_mask: torch.Tensor,
+            domain_ids: torch.Tensor,
+            e_sem: torch.Tensor | None,
+            kin_group_masked: bool = False,
+            e_traj_sem_detached: torch.Tensor | None = None
+    ) -> dict:
+        """Masking-recovery with optional soft contrastive regularizer"""
+        out = self.forward(
+            x_spatial, tau, kinematics, coords, pad_mask, pos_mask,
+            domain_ids, e_sem, kin_group_masked
+        )
         loss_recovery = out['loss']
-        loss_sem_pred = torch.tensor(0.0, device=x_spatial.device)
 
-        # Semantic alignment auxiliary loss (modes 1–4 only)
-        if not sem_group_masked and e_sem_target is not None:
-            h = out['h']   # (B, L, d) — output of g (or encoder if g=None)
-            valid = (~pad_mask).float().unsqueeze(-1)              # (B, L, 1)
-            h_pool = (h * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)  # (B, d)
-            e_pred = self.W_sem_pred(h_pool)                       # (B, sem_dim)
-            loss_sem_pred = F.mse_loss(e_pred, e_sem_target)
+        if e_traj_sem_detached is not None:
+            z_traj = self.trajectory_embedding(
+                x_spatial, tau, kinematics, coords, pad_mask, domain_ids, e_sem
+            )
+            loss_ctr = self.info_nce(z_traj, e_traj_sem_detached, detach_e=True)
+            out['loss'] = loss_recovery + self.cfg.contrastive_lambda * loss_ctr
+            out['loss_contrastive'] = loss_ctr
+        else:
+            out['loss_contrastive'] = torch.tensor(0.0, device=x_spatial.device)
 
-        out['loss'] = loss_recovery + alpha * loss_sem_pred
         out['loss_recovery'] = loss_recovery
-        out['loss_sem_pred'] = loss_sem_pred
         return out
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
