@@ -249,12 +249,12 @@ def main():
     parser.add_argument('--no-resume', action='store_false', dest='resume',
                         help='Force fresh encoding even if a .progress file exists')
     parser.add_argument('--truncate-dim', type=int, default=256, metavar='N')
-    # parser.add_argument('--attn-impl', default=None,
-    #                     choices=['sdpa', 'flash_attention_2'],
-    #                     help='Attention implementation. '
-    #                          'sdpa: PyTorch 2.0+ native, no install needed. '
-    #                          'flash_attention_2: fastest on H100/A100, '
-    #                          'requires: pip install flash-attn --no-build-isolation')
+    parser.add_argument('--attn-impl', default=None,
+                        choices=['sdpa', 'flash_attention_2'],
+                        help='Attention implementation. '
+                             'sdpa: PyTorch 2.0+ native, no install needed. '
+                             'flash_attention_2: fastest on H100/A100, '
+                             'requires: pip install flash-attn --no-build-isolation')
     parser.add_argument('--hf-repo', default=None, metavar='REPO_ID')
     parser.add_argument('--upload-every', type=int, default=10, metavar='N')
 
