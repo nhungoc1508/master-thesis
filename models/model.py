@@ -1,6 +1,3 @@
-"""
-
-"""
 from __future__ import annotations
 
 import sys
@@ -16,6 +13,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config import ModelConfig
+
+# ========== Fourier temporal encoder ==========
 
 class FourierEncode(nn.Module):
     """
@@ -63,7 +62,156 @@ class FourierTemporalEncoder(nn.Module):
         parts = [enc(tau[..., i]) for i, enc in enumerate(self.encoders)]
         feats = torch.cat(parts, dim=-1) # (B, L, n_components * embed_dim)
         return self.proj(feats) # (B, L, out_dim)
+
+# ========== Sparse cross-domain mixture of experts ==========
+
+class Expert(nn.Module):
+    """One expert: 2-layer MLP with hidden dim 2*d & GELU"""
+
+    def __init__(self, d_model: int, hidden_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, d_model),
+            nn.Dropout(dropout)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+class NoisyTopKRouter(nn.Module):
+    """Top-K gating with noisy logits"""
+
+    def __init__(self, d_model: int, n_experts: int, top_k: int):
+        super().__init__()
+        self.top_k = top_k
+        self.n_experts = n_experts
+        self.gate = nn.Linear(d_model, n_experts)
+        self.noise = nn.Linear(d_model, n_experts)
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x (N, d): flattened tokens
+
+        Returns:
+            sparse_gates (N, C): softmax gate values over the top-K experts (0 elsewhere) = g(x)
+            topk_idx (N, K): indices of selected experts
+            clean_logits (N, C): noise-free gate logits
+            noisy_logits (N, C): gate logits actually used for routing
+            noise_std (N, C): per-expert noise standard deviation (softplus)
+        
+        Formula:
+            H(x)_i = (x \cdot W_g)_i + StandardNormal() \cdot Softplus((x \cdot W_noise)_i)
+            G(x) = Softmax(KeepTopK(H(x), k))
+        """
+        clean_logits = self.gate(x) # x \cdot W_g
+        noise_std = F.softplus(self.noise(x)) + 1e-2 # Softplus(x \cdot W_noise)
+        if self.training:
+            noisy_logits = clean_logits +  torch.randn_like(clean_logits) * noise_std
+        else:
+            noisy_logits = clean_logits
+        
+        topk_logits, topk_idx = noisy_logits.topk(self.top_k, dim=-1) # (N, K)
+        sparse = torch.full_like(noisy_logits, float('-inf'))
+        sparse.scatter_(-1, topk_idx, topk_logits)
+        sparse_gates = F.softmax(sparse, dim=-1) # (N, C), 0 for non-top-K
+        return sparse_gates, topk_idx, clean_logits, noisy_logits, noise_std
     
+class SparseCrossDomainMoE(nn.Module):
+    """
+    Sparse Cross-Domain Mixture of Experts
+
+    Replaces a single FFN with C experts. Each token is routed to its top-K
+    experts and their outputs are combined by the gating weights
+    Returns the mixed output plus a scalar load-balancing loss
+    computed over valid tokens
+
+    Formula: y = \sum_{i=1}^C G(x)_i \cdot E_i(x)
+
+    The auxiliary balancing loss: L_aux = w \cdot (CV(Importance)^2 + CV(Load)^2)
+        Importance(c) = \sum_x G_c(x) = batchwise sum of gate values
+        Load(c) = \sum_x P(x, c) = smooth count of tokens routed to c
+        CV() = std / mean = coefficient of variation
+        P(x, c) = probability that expert c stays in/enters the top-K under
+            a fresh draw of the gating noise
+    """
+
+    def __init__(self, d_model: int, hidden_dim: int, n_experts: int = 8,
+                 top_k: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.n_experts = n_experts
+        self.top_k = top_k
+        self.router = NoisyTopKRouter(d_model, n_experts, top_k)
+        self.experts = nn.ModuleList(
+            [Expert(d_model, hidden_dim, dropout) for _ in range(n_experts)]
+        )
+
+    def _load(self, clean_logits: torch.Tensor, noisy_logits: torch.Tensor,
+              noise_std: torch.Tensor) -> torch.Tensor:
+        """
+        Smooth per-expert load P(x, c) summed over tokens.
+        """
+        k = self.top_k
+        # top-(K+1) of the noisy logits gives both thresholds
+        top_vals, _ = noisy_logits.topk(k + 1, dim=-1)
+        thr_kth = top_vals[..., k - 1:k]
+        thr_k1th = top_vals[..., k:k + 1]
+
+        # Is expert c currently in the top-K? (its noisy value >= K-th highest)
+        is_in = noisy_logits >= thr_kth
+        # Threshold to beat: (K+1)-th if already in, else K-th
+        threshold = torch.where(is_in, thr_k1th, thr_kth)
+        _NORMAL = torch.distributions.Normal(0.0, 1.0)
+        prob = _NORMAL.cdf((clean_logits - threshold) / noise_std)
+        return prob
+
+    def forward(self, x: torch.Tensor, valid_mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            x: (B, L, d)
+            valid_mask: (B, L) bool, True = real token (non-pad)
+
+        Returns:
+            output: (B, L, d)
+            aux_loss: scalar
+        """
+        B, L, d = x.shape
+        flat_x = x.reshape(-1, d)
+        sparse_gates, topk_idx, clean_logits, noisy_logits, noise_std = self.router(flat_x)
+
+        out = torch.zeros_like(flat_x)
+        for c, expert in enumerate(self.experts):
+            sel = (topk_idx == c).any(dim=-1)
+            if sel.any():
+                contrib = expert(flat_x[sel]) * sparse_gates[sel, c].unsqueeze(-1)
+                out[sel] += contrib
+        out = out.view(B, L, d)
+
+        # Balancing loss over valid tokens
+        if valid_mask is not None:
+            vflat = valid_mask.reshape(-1)
+        else:
+            vflat = torch.ones(flat_x.size(0), dtype=torch.bool, device=x.device)
+        vmask = vflat.unsqueeze(-1).float()
+
+        importance = (sparse_gates * vmask).sum(dim=0)
+        load = (self._load(clean_logits, noisy_logits, noise_std) * vmask).sum(dim=0)  # (C,)
+        aux_loss = self._cv_squared(importance) + self._cv_squared(load)
+        return out, aux_loss
+    
+    def _cv_squared(self, x: torch.Tensor, eps: float=1e-10) -> torch.Tensor:
+        """Squared coefficient of variation: Var(x) / (Mean(x)^2); zero when uniform"""
+        if x.numel() <= 1:
+            return x.new_tensor(0.0)
+        mean = x.mean()
+        var = x.var(unbiased=False)
+        return var / (mean ** 2 + eps)
+
+# ========== Transformer with STPE & SCD-MoE ==========
+
 class STPEMultiheadAttention(nn.Module):
     """
     Multi-head attention with spatio-temporal rotary positional encoding applied
@@ -122,13 +270,13 @@ class STPEMultiheadAttention(nn.Module):
 class DomainAwareSTPELayer(nn.Module):
     """
     Transformer layer with spatio-temporal rotary positional encoding (STPE)
-    with per-domain spatial frequency offset
+    with per-domain spatial frequency offset + mixture of experts
 
     \phi_i = W_phi \cdot [x, y]^T + W_phi_dom[domain]
     """
 
-    def __init__(self, d_model: int, n_heads: int, ffn_dim: int,
-                 n_domains: int = 2, dropout: float = 0.1):
+    def __init__(self, d_model: int, n_heads: int, n_domains: int = 2,
+                 n_experts: int = 8, top_k: int = 4, dropout: float = 0.1):
         super().__init__()
         d_h = d_model // n_heads
         n_freqs = d_h // 2
@@ -143,13 +291,16 @@ class DomainAwareSTPELayer(nn.Module):
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, ffn_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(ffn_dim, d_model),
-            nn.Dropout(dropout)
-        )
+        # MoE replaces traditional FFN
+        self.moe = SparseCrossDomainMoE(d_model, hidden_dim=2*d_model, n_experts=n_experts,
+                                        top_k=top_k, dropout=dropout)
+        # self.ffn = nn.Sequential(
+        #     nn.Linear(d_model, ffn_dim),
+        #     nn.GELU(),
+        #     nn.Dropout(dropout),
+        #     nn.Linear(ffn_dim, d_model),
+        #     nn.Dropout(dropout)
+        # )
     
     def forward(self, x: torch.Tensor, coords: torch.Tensor, domain_ids: torch.Tensor,
                 pad_mask: torch.Tensor | None = None) -> torch.Tensor:
@@ -191,9 +342,15 @@ class DomainAwareSTPELayer(nn.Module):
         out = self.attn.W_o(out)
         x = x + out
 
-        x = x + self.ffn(self.norm2(x))
-        return x
-    
+        # x = x + self.ffn(self.norm2(x))
+        # Moe block
+        valid_mask = (~pad_mask) if pad_mask is not None else None
+        moe_out, lb_loss = self.moe(self.norm2(x), valid_mask=valid_mask)
+        x = x + moe_out
+        return x, lb_loss
+
+# ========== Semantic cross-attention ==========
+
 class SemanticCrossAttention(nn.Module):
     """
     Cross-attention block g: H = CrossAttn(Q=Z, K=E_sem, V=E_sem) + Z
@@ -256,9 +413,12 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         # projecting via W_kin: 3 -> d
         self.W_kin = nn.Linear(3, d, bias=False)
 
-        # Domain-aware STRPE layers
+        # Domain-aware STRPE layers + MoE
         self.layers = nn.ModuleList([
-            DomainAwareSTPELayer(d, cfg.n_heads, cfg.ffn_dim, cfg.n_domains, cfg.dropout)
+            DomainAwareSTPELayer(
+                d, cfg.n_heads, cfg.n_domains,
+                n_experts=cfg.n_experts, top_k=cfg.moe_top_k,
+                dropout=cfg.dropout)
             for _ in range(cfg.n_layers)
         ])
         self.norm = nn.LayerNorm(d)
@@ -318,6 +478,16 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
             return self.kin_unk.view(1, 1, 3).expand_as(kinematics)
         return kinematics
 
+    def _run_layers(self, z: torch.Tensor, coords: torch.Tensor, domain_ids: torch.Tensor,
+                    pad_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run all MoE layers, accumulating mean load-balance loss"""
+        lb_total = z.new_tensor(0.0)
+        for layer in self.layers:
+            z, lb = layer(z, coords, domain_ids, pad_mask=pad_mask)
+            lb_total = lb_total + lb
+        lb_total = lb_total / max(len(self.layers), 1)
+        return self.norm(z), lb_total
+
     def encode(
         self,
         x_spatial: torch.Tensor,
@@ -333,10 +503,11 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         kin = self._apply_kin_unk(kinematics, kin_group_masked)
         e = self._embed(x_spatial, tau, kin, domain_ids)
 
-        z = e
-        for layer in self.layers:
-            z = layer(z, coords, domain_ids, pad_mask=pad_mask)
-        z = self.norm(z)
+        # z = e
+        # for layer in self.layers:
+        #     z = layer(z, coords, domain_ids, pad_mask=pad_mask)
+        # z = self.norm(z)
+        z, _ = self._run_layers(e, coords, domain_ids, pad_mask)
 
         if self.g is not None:
             if e_sem is None and hasattr(self, 'no_sem'):
@@ -412,10 +583,11 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
             # If not masked, coords remains visible
             coords_input = coords
 
-        z = e
-        for layer in self.layers:
-            z = layer(z, coords_input, domain_ids, pad_mask=pad_mask)
-        z = self.norm(z)
+        # z = e
+        # for layer in self.layers:
+        #     z = layer(z, coords_input, domain_ids, pad_mask=pad_mask)
+        # z = self.norm(z)
+        z, lb_loss = self._run_layers(e, coords_input, domain_ids, pad_mask)
 
         if self.g is not None:
             if e_sem_use is not None:
@@ -427,7 +599,7 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
 
         pred = self.output_head(h)
 
-        out = {'pred': pred, 'z': z, 'h': h}
+        out = {'pred': pred, 'z': z, 'h': h, 'loss_balance': lb_loss}
         if pos_mask is not None:
             real_masked = pos_mask & ~pad_mask
             if real_masked.any():
@@ -501,23 +673,27 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
             kin_group_masked: bool = False,
             e_traj_sem_detached: torch.Tensor | None = None
     ) -> dict:
-        """Masking-recovery with optional soft contrastive regularizer"""
+        """Masking-recovery + soft contrastive regulariser + MoE load balancing"""
         out = self.forward(
             x_spatial, tau, kinematics, coords, pad_mask, pos_mask,
             domain_ids, e_sem, kin_group_masked
         )
         loss_recovery = out['loss']
+        lb_loss = out['loss_balance']
+
+        total = loss_recovery + self.cfg.moe_lambda * lb_loss
 
         if e_traj_sem_detached is not None:
             z_traj = self.trajectory_embedding(
                 x_spatial, tau, kinematics, coords, pad_mask, domain_ids, e_sem
             )
             loss_ctr = self.info_nce(z_traj, e_traj_sem_detached, detach_e=True)
-            out['loss'] = loss_recovery + self.cfg.contrastive_lambda * loss_ctr
+            total = total + self.cfg.contrastive_lambda * loss_ctr
             out['loss_contrastive'] = loss_ctr
         else:
             out['loss_contrastive'] = torch.tensor(0.0, device=x_spatial.device)
 
+        out['loss'] = total
         out['loss_recovery'] = loss_recovery
         return out
 

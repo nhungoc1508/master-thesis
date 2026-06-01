@@ -6,7 +6,7 @@ class ModelConfig:
     input_dim: int = 6 # [d_lat, d_lon, d_t, speed_n, heading_n, turn_n]
     d_model: int = 128
     n_heads: int = 4
-    n_layers: int = 4
+    n_layers: int = 6
     ffn_dim: int = 512
     dropout: float = 0.1
     max_len: int = 256
@@ -15,6 +15,11 @@ class ModelConfig:
     use_semantics: bool = True
     no_sem_token: bool = True
     n_domains: int = 2
+
+    # Sparse Cross-Domain Mixture of Experts replacing per-block FFN
+    n_experts: int = 8          # C: total number of expert networks
+    moe_top_k: int = 4          # K: active experts per token
+    moe_lambda: float = 0.1    # load-balancing loss weight
     
     # Single-stage training with auxiliary semantic prediction head
     epochs: int = 50
