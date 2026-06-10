@@ -498,6 +498,7 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         domain_ids: torch.Tensor,
         e_sem: torch.Tensor | None = None,
         kin_group_masked: bool = False,
+        apply_g: bool = True,
     ) -> torch.Tensor:
         B, L, _ = x_spatial.shape
         kin = self._apply_kin_unk(kinematics, kin_group_masked)
@@ -509,7 +510,7 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         # z = self.norm(z)
         z, _ = self._run_layers(e, coords, domain_ids, pad_mask)
 
-        if self.g is not None:
+        if apply_g and self.g is not None:
             if e_sem is None and hasattr(self, 'no_sem'):
                 e_sem = self.no_sem.view(1, 1, -1).expand(B, L, -1)
             if e_sem is not None:
@@ -652,9 +653,16 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
             domain_ids: torch.Tensor,
             e_sem: torch.Tensor
     ) -> dict:
-        """Contrastive learning (trajectory - semantic)"""
+        """
+        Contrastive learning (trajectory - semantic).
+
+        Aligns the BARE encoder backbone (apply_g=False) with the trajectory's
+        semantic embedding. g is not exercised here; it is trained only in
+        Stage 2.
+        """
         z_traj = self.trajectory_embedding(
-            x_spatial, tau, kinematics, coords, pad_mask, domain_ids, e_sem=None
+            x_spatial, tau, kinematics, coords, pad_mask, domain_ids,
+            e_sem=None, apply_g=False
         )
         e_traj = self.semantic_trajectory_embedding(e_sem, pad_mask)
         loss = self.info_nce(z_traj, e_traj)
