@@ -15,7 +15,7 @@ import pandas as pd
 Domain = Literal['urban', 'maritime']
 
 ICR_INTERVAL = {'urban': 30}
-MAX_LEN = {'urban': 128, 'maritime': 256}
+MAX_LEN = {'urban': 256, 'maritime': 256}
 
 def icr(df: pd.DataFrame, domain: Domain, ts_col: str = 'ts_unix') -> pd.DataFrame:
     """Resample to canonical interval, keep first point in each d_t_can bucket"""

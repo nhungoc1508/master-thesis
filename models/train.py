@@ -462,12 +462,16 @@ def _match_sem_npys(
         sem_dir = Path(sem_input[0])
         result: list[Path | None] = []
         for p in parquet_paths:
-            candidate = sem_dir / f"{_sem_base(p, domain)}_described_sem.npy"
+            candidate = sem_dir / f"{_sem_base(p, domain)}_sem.npy"
             if candidate.exists():
                 result.append(candidate)
             else:
-                logger.warning("No sem .npy for %s (expected %s)", p.name, candidate)
-                result.append(None)
+                candidate_alt = sem_dir / f"{_sem_base(p, domain)}_described_sem.npy"
+                if candidate_alt.exists():
+                    result.append(candidate_alt)
+                else:
+                    logger.warning("No sem .npy for %s (expected %s)", p.name, candidate)
+                    result.append(None)
         n_matched = sum(r is not None for r in result)
         logger.info('Sem .npy auto-match: %d/%d found in %s', n_matched, len(result), sem_dir)
         return result
