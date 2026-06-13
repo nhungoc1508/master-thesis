@@ -5,7 +5,8 @@ Usage:
         --urban-train  data/urban/enriched/ \
         --urban-sem-npy data/urban/encoded/ \
         --maritime-train data/maritime/canonical/ \
-        --maritime-sem-npy data/maritime/encoded/
+        --maritime-sem-npy data/maritime/encoded/ \
+        --hf-repo nhungoc1508/tfm
 
     Explicit list:
         python train.py \\
@@ -108,12 +109,46 @@ def _kinematics(batch: dict, device: torch.device) -> torch.Tensor:
     B, L = batch['x'].shape[:2]
     return torch.zeros(B, L, 3, device=device)
 
+# ========== HuggingFace checkpoint backup ==========
+
+def _ensure_hf_repo(repo_id: str) -> None:
+    """Create the HuggingFace model repo if does not already exist"""
+    try:
+        from huggingface_hub import create_repo
+        create_repo(repo_id, repo_type='model', private=True, exist_ok=True)
+        logger.info('HuggingFace model repo ready: hf://%s', repo_id)
+    except Exception as exc:
+        logger.warning('Could not create/verify HF repo %s: %s', repo_id, exc)
+
+def _hf_upload_checkpoint(local_path: Path, repo_id: str,
+                          path_in_repo: str | None = None) -> None:
+    """
+    Upload a checkpoint file to a HuggingFace MODEL repo, overwriting any
+    existing file at the same path. Failures are logged, never raised, so a
+    network error cannot abort training.
+    """
+    try:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        path_in_repo = path_in_repo or Path(local_path).name
+        logger.info('Uploading %s to hf://%s', Path(local_path).name, repo_id)
+        api.upload_file(
+            path_or_fileobj=str(local_path),
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            repo_type='model',
+        )
+        logger.info('Upload complete.')
+    except Exception as exc:
+        logger.warning('HuggingFace upload failed (training continues): %s', exc)
+
 # ========== Train/val loops ==========
 
 # Two-stage training
 
 def run_stage1(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val_loader: DataLoader,
-               cfg: ModelConfig, device: torch.device, checkpoint_dir: Path) -> None:
+               cfg: ModelConfig, device: torch.device, checkpoint_dir: Path,
+               hf_repo: str | None = None) -> None:
     logger.info('===== Stage 1: Contrastive learning (%d epochs) =====', cfg.stage1_epochs)
     optimizer = AdamW(list(model.parameters()), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=cfg.stage1_epochs, eta_min = cfg.lr_min)
@@ -182,12 +217,14 @@ def run_stage1(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
                  checkpoint_dir / 'stage1_best.pt'
             )
             logger.info('\tNew best model saved to %s', checkpoint_dir)
-    
+            if hf_repo:
+                _hf_upload_checkpoint(checkpoint_dir / 'stage1_best.pt', hf_repo)
+
     logger.info('Stage 1 complete; best val: %.8f', best_val)
 
 def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val_loader: DataLoader,
                cfg: ModelConfig, device: torch.device, checkpoint_dir: Path,
-               rng: np.random.Generator) -> None:
+               rng: np.random.Generator, hf_repo: str | None = None) -> None:
     logger.info('===== Stage 2: Masking-recovery + soft contrastive (%d epochs) =====', cfg.stage2_epochs)
     optimizer = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=cfg.stage2_epochs, eta_min=cfg.lr_min)
@@ -278,6 +315,8 @@ def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
                  checkpoint_dir / 'best.pt'
             )
             logger.info('\tNew best model saved to %s', checkpoint_dir)
+            if hf_repo:
+                _hf_upload_checkpoint(checkpoint_dir / 'best.pt', hf_repo)
         else:
             patience_count += 1
             if patience_count >= cfg.patience:
@@ -514,13 +553,18 @@ def train(cfg: ModelConfig, args: argparse.Namespace) -> None:
     checkpoint_dir = Path(cfg.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    hf_repo = getattr(args, 'hf_repo', None)
+    if hf_repo:
+        _ensure_hf_repo(hf_repo)
+        logger.info('Best checkpoints will be backed up to hf://%s', hf_repo)
+
     rng = np.random.default_rng()
 
     # Two-stage training
     logger.info('Training: stage1=%d epochs | stage2=%d epochs | lr=%.1e | batch_size=%d',
                 cfg.stage1_epochs, cfg.stage2_epochs, cfg.lr, cfg.batch_size)
-    run_stage1(model, train_loader, val_loader, cfg, device, checkpoint_dir)
-    run_stage2(model, train_loader, val_loader, cfg, device, checkpoint_dir, rng)
+    run_stage1(model, train_loader, val_loader, cfg, device, checkpoint_dir, hf_repo=hf_repo)
+    run_stage2(model, train_loader, val_loader, cfg, device, checkpoint_dir, rng, hf_repo=hf_repo)
     logger.info('Training complete. Best checkpoint: %s', checkpoint_dir / 'best.pt')
 
     # Single-stage training
@@ -579,6 +623,7 @@ def main():
     parser.add_argument('--alpha', type=float, default=0.05)
     parser.add_argument('--no-semantics', action='store_true')
     parser.add_argument('--checkpoint-dir', default='checkpoints')
+    parser.add_argument('--hf-repo', default=None, metavar='REPO_ID')
     args = parser.parse_args()
 
     cfg = ModelConfig(
