@@ -57,9 +57,11 @@ class TrajectoryDataset(Dataset):
         if len(sem_npy_paths) != len(parquet_paths):
             raise ValueError('sem_npy_paths must have the same length as parquet_paths')
 
-        self.trajectories: list[pd.DataFrame] = []
+        # Each entry is a dict of precomputed numpy arrays for one trajectory:
+        #   coords (n,2) f32, tau (n,4) f32, kin (n,3) f32 | None, abs_rows (n,) i64, traj_id str
+        self.trajectories: list[dict] = []
         self._sem_memmaps: list[np.memmap | None] = []
-        
+
         self._load(parquet_paths, sem_npy_paths)
 
     def _load(self, paths: list[Path | str], sem_npy_paths: list[Path | str | None]):
@@ -102,12 +104,54 @@ class TrajectoryDataset(Dataset):
                 logger.info('\tICR: %d -> %d rows (%.1f%% kept)',
                             n_rows_before, len(df), 100 * len(df) / n_rows_before)
 
+            # Single global sort by (trajectory_id, time)
+            df = df.sort_values(['trajectory_id', 'ts_unix']).reset_index(drop=True)
+
+            # ----- Vectorized temporal features over the whole file (once) -----
+            ts_int = df['ts_unix'].values.astype(np.int64)
+            dt_index = pd.to_datetime(ts_int, unit='s', utc=True)
+            moh = (dt_index.minute.values / 59.0).astype(np.float32)
+            if 'day_of_week' in df.columns and 'hour_of_day' in df.columns:
+                dow = (df['day_of_week'].values.astype(np.float32) / 6.0)
+                hod = (df['hour_of_day'].values.astype(np.float32) / 23.0)
+            else:
+                dow = (dt_index.dayofweek.values / 6.0).astype(np.float32)
+                hod = (dt_index.hour.values / 23.0).astype(np.float32)
+
+            # ----- Vectorized kinematics over the whole file (once) -----
+            kin_all = self._kinematics_raw(df)
+
+            # ----- Extract plain numpy columns -----
+            tid = df['trajectory_id'].values
+            lat_all = df['lat'].values.astype(np.float32)
+            lon_all = df['lon'].values.astype(np.float32)
+            ts_all = df['ts_unix'].values.astype(np.float64)
+            abs_all = df['_abs_row'].values.astype(np.int64)
+
+            # ----- Per-trajectory segment boundaries (df sorted by tid) -----
+            if len(tid) == 0:
+                continue
+            cut = np.flatnonzero(tid[1:] != tid[:-1]) + 1
+            starts = np.concatenate([[0], cut])
+            ends = np.concatenate([cut, [len(tid)]])
+
             n_before = len(self.trajectories)
-            for _, grp in df.groupby('trajectory_id', sort=False):
-                grp = grp.sort_values('ts_unix').reset_index(drop=True)
-                if len(grp) < 2:
+            for s, e in zip(starts.tolist(), ends.tolist()):
+                if e - s < 2:
                     continue
-                self.trajectories.append(grp)
+                d_lat, d_lon, d_t, _, _ = normalize_trajectory(
+                    lat_all[s:e], lon_all[s:e], ts_all[s:e]
+                )
+                coords = np.stack([d_lat, d_lon], axis=1).astype(np.float32)
+                tau = np.stack([dow[s:e], hod[s:e], moh[s:e],
+                                d_t.astype(np.float32)], axis=1)
+                self.trajectories.append({
+                    'coords': coords,
+                    'tau': tau,
+                    'kin': kin_all[s:e].copy() if kin_all is not None else None,
+                    'abs_rows': abs_all[s:e].copy(),
+                    'traj_id': str(tid[s]),
+                })
                 self._sem_memmaps.append(sem_mm)
 
             n_added = len(self.trajectories) - n_before
@@ -116,22 +160,18 @@ class TrajectoryDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.trajectories)
-    
+
     def __getitem__(self, idx: int) -> dict:
-        df = self.trajectories[idx]
+        rec = self.trajectories[idx]
         sem_mm = self._sem_memmaps[idx]
-        
-        lats = df['lat'].values.astype(np.float32)
-        lons = df['lon'].values.astype(np.float32)
-        ts = df['ts_unix'].values.astype(np.float64)
-        abs_rows = df['_abs_row'].values.copy()
 
-        d_lat, d_lon, d_t, _, _ = normalize_trajectory(lats, lons, ts)
-        coords = np.stack([d_lat, d_lon], axis=1).astype(np.float32)
-        tau = self._build_tau(df, d_t)
-        kin = self._get_kinematics_raw(df)
+        coords = rec['coords']          # (n, 2)
+        tau = rec['tau']                # (n, 4); tau[:, 3] = d_t_norm
+        kin = rec['kin']                # (n, 3) or None
+        abs_rows = rec['abs_rows']      # (n,)
 
-        x = np.stack([d_lat, d_lon, d_t], axis=1).astype(np.float32)
+        # x = [d_lat, d_lon, d_t] (+ kinematics if input_dim == 6)
+        x = np.concatenate([coords, tau[:, 3:4]], axis=1)
         if self.input_dim == 6 and kin is not None:
             x = np.concatenate([x, kin], axis=1)
 
@@ -145,7 +185,7 @@ class TrajectoryDataset(Dataset):
             abs_rows = abs_rows[idxs]
             if kin is not None:
                 kin = kin[idxs]
-        
+
         traj_len = len(x)
         x_pad, pad_mask = _pad(x, self.max_len)
         coords_pad, _ = _pad(coords, self.max_len)
@@ -157,7 +197,7 @@ class TrajectoryDataset(Dataset):
             'tau': torch.from_numpy(tau_pad),
             'pad_mask': torch.from_numpy(pad_mask),
             'traj_len': traj_len,
-            'trajectory_id': str(df['trajectory_id'].iloc[0]),
+            'trajectory_id': rec['traj_id'],
             'domain': 0 if self.domain == 'urban' else 1
         }
 
@@ -173,24 +213,10 @@ class TrajectoryDataset(Dataset):
         item['e_sem'] = self._load_sem(sem_mm, abs_rows, traj_len)
 
         return item
-    
-    @staticmethod
-    def _build_tau(df: pd.DataFrame, d_t_norm: np.ndarray) -> np.ndarray:
-        ts_int = df['ts_unix'].values.astype(np.int64)
-        dt_index = pd.to_datetime(ts_int, unit='s', utc=True)
-        moh = (dt_index.minute.values / 59.0).astype(np.float32) # [0, 1]
 
-        if 'day_of_week' in df.columns and 'hour_of_day' in df.columns:
-            dow = df['day_of_week'].values.astype(np.float32) / 6.0
-            hod = df['hour_of_day'].values.astype(np.float32) / 23.0
-        else:
-            dow = (dt_index.dayofweek.values / 6.0).astype(np.float32)
-            hod = (dt_index.hour.values / 23.0).astype(np.float32)
-
-        return np.stack([dow, hod, moh, d_t_norm.astype(np.float32)], axis=1)
-    
     @staticmethod
-    def _get_kinematics_raw(df: pd.DataFrame) -> np.ndarray | None:
+    def _kinematics_raw(df: pd.DataFrame) -> np.ndarray | None:
+        """Vectorized kinematics over a whole dataframe; called once at load."""
         if not all(c in df.columns for c in ('SOG', 'COG', 'ROT')):
             return None
         sog = np.nan_to_num(df['SOG'].values.astype(np.float32), nan=0.0)

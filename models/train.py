@@ -500,13 +500,20 @@ def build_loader(parquet_paths: list[Path], domain: str, sem_input: list[str] | 
         batch_size=batch_size,
         shuffle=shuffle,
         collate_fn=collate_fn,
-        num_workers=4 if shuffle else 2,
-        pin_memory=True
+        num_workers=cfg.num_workers if shuffle else max(2, cfg.num_workers // 2),
+        pin_memory=True,
+        persistent_workers=cfg.num_workers > 0,
+        prefetch_factor=4 if cfg.num_workers > 0 else None,
     )
 
 def train(cfg: ModelConfig, args: argparse.Namespace) -> None:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info('Device: %s', device)
+
+    # Enable TF32 matmul/conv on Ampere+ (A100) — free speedup, no accuracy concern here
+    if device.type == 'cuda':
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     def _paths(p: str | None) -> list[Path]:
         if not p:
@@ -621,6 +628,7 @@ def main():
     parser.add_argument('--stage1-epochs', type=int, default=15)    # two-stage
     parser.add_argument('--stage2-epochs', type=int, default=35)    # two-stage
     parser.add_argument('--batch-size', type=int, default=128)
+    parser.add_argument('--num-workers', type=int, default=8)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--d-model', type=int, default=128)
     parser.add_argument('--max-len', type=int, default=256)
@@ -635,6 +643,7 @@ def main():
         max_len=args.max_len,
         epochs=args.epochs,
         batch_size=args.batch_size,
+        num_workers=args.num_workers,
         lr=args.lr,
         sem_pred_alpha=args.alpha,
         use_semantics=not args.no_semantics,
