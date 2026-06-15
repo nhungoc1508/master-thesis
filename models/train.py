@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import random
 import sys
 from pathlib import Path
 from itertools import chain
@@ -142,20 +143,105 @@ def _hf_upload_checkpoint(local_path: Path, repo_id: str,
     except Exception as exc:
         logger.warning('HuggingFace upload failed (training continues): %s', exc)
 
+# ========== Checkpoint resume ==========
+
+def _rng_state() -> dict:
+    """Snapshot all global RNG states for exact resume."""
+    st = {
+        'python': random.getstate(),
+        'numpy': np.random.get_state(),
+        'torch': torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        st['cuda'] = torch.cuda.get_rng_state_all()
+    return st
+
+def _restore_rng(st: dict | None) -> None:
+    if not st:
+        return
+    try:
+        random.setstate(st['python'])
+        np.random.set_state(st['numpy'])
+        torch.set_rng_state(st['torch'])
+        if 'cuda' in st and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(st['cuda'])
+    except Exception as exc:
+        logger.warning('Could not fully restore RNG state: %s', exc)
+
+def _load_checkpoint(model: TrajectoryMaskedAutoEncoder, ckpt_path: str,
+                     device: torch.device) -> dict:
+    """Load model weights from a saved checkpoint and return the full ckpt dict."""
+    path = Path(ckpt_path)
+    if not path.exists():
+        raise FileNotFoundError(f'Checkpoint not found: {path}')
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    state = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    logger.info('Loaded weights from %s (epoch=%s, stage=%s)', path.name,
+                ckpt.get('epoch', '?') if isinstance(ckpt, dict) else '?',
+                ckpt.get('stage', '?') if isinstance(ckpt, dict) else '?')
+    if missing:
+        logger.warning('\tmissing keys: %d (e.g. %s)', len(missing), missing[:3])
+    if unexpected:
+        logger.warning('\tunexpected keys: %d (e.g. %s)', len(unexpected), unexpected[:3])
+    return ckpt if isinstance(ckpt, dict) else {'model': ckpt}
+
+def _restore_train_state(optimizer, scheduler, resume_state: dict | None,
+                         start_epoch: int, expected_stage: int) -> tuple[float, int]:
+    """
+    Restore optimizer/scheduler/RNG from a resume checkpoint. Returns (best_val, step).
+    Falls back to fast-forwarding the scheduler if optimizer/scheduler state is absent
+    (e.g. an older checkpoint that only saved weights).
+    """
+    best_val, step = float('inf'), 0
+    if resume_state is None:
+        return best_val, step
+
+    ckpt_stage = resume_state.get('stage')
+    if ckpt_stage is not None and ckpt_stage != expected_stage:
+        logger.warning('Checkpoint stage=%s but resuming stage %d - optimizer state '
+                       'may not correspond; continuing anyway.', ckpt_stage, expected_stage)
+
+    if 'optimizer' in resume_state:
+        optimizer.load_state_dict(resume_state['optimizer'])
+        logger.info('\trestored optimizer state')
+    else:
+        logger.warning('\tno optimizer state in checkpoint - Adam moments start fresh')
+
+    if 'scheduler' in resume_state:
+        scheduler.load_state_dict(resume_state['scheduler'])
+        logger.info('\trestored LR scheduler state')
+    else:
+        for _ in range(start_epoch):
+            scheduler.step()
+        logger.info('\tno scheduler state - fast-forwarded LR by %d epochs', start_epoch)
+
+    best_val = resume_state.get('best_val', resume_state.get('val_rec', float('inf')))
+    step = resume_state.get('step', 0)
+    _restore_rng(resume_state.get('rng'))
+    logger.info('\trestored best_val=%.6f, step=%d, RNG state', best_val, step)
+    return best_val, step
+
 # ========== Train/val loops ==========
 
 # Two-stage training
 
 def run_stage1(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val_loader: DataLoader,
                cfg: ModelConfig, device: torch.device, checkpoint_dir: Path,
-               hf_repo: str | None = None) -> None:
-    logger.info('===== Stage 1: Contrastive learning (%d epochs) =====', cfg.stage1_epochs)
+               hf_repo: str | None = None, start_epoch: int = 0,
+               resume_state: dict | None = None) -> None:
+    logger.info('===== Stage 1: Contrastive learning (%d epochs%s) =====', cfg.stage1_epochs,
+                f', resuming after epoch {start_epoch}' if start_epoch else '')
+    if start_epoch >= cfg.stage1_epochs:
+        logger.info('Stage 1 already complete (%d/%d epochs); skipping.',
+                    start_epoch, cfg.stage1_epochs)
+        return
     optimizer = AdamW(list(model.parameters()), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=cfg.stage1_epochs, eta_min = cfg.lr_min)
-    step = 0
-    best_val = float('inf')
+    best_val, step = _restore_train_state(optimizer, scheduler, resume_state,
+                                          start_epoch, expected_stage=1)
 
-    for epoch in range(1, cfg.stage1_epochs + 1):
+    for epoch in range(start_epoch + 1, cfg.stage1_epochs + 1):
         model.train()
         total_loss = 0.0
         n_batches = 0
@@ -212,8 +298,10 @@ def run_stage1(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
         if val_loss < best_val:
             best_val = val_loss
             torch.save(
-                {'epoch': epoch, 'model': model.state_dict(),
-                 'best_val': best_val, 'cfg': dataclasses.asdict(cfg)},
+                {'epoch': epoch, 'stage': 1, 'model': model.state_dict(),
+                 'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(),
+                 'best_val': best_val, 'step': step, 'rng': _rng_state(),
+                 'cfg': dataclasses.asdict(cfg)},
                  checkpoint_dir / 'stage1_best.pt'
             )
             logger.info('\tNew best model saved to %s', checkpoint_dir)
@@ -224,15 +312,22 @@ def run_stage1(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
 
 def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val_loader: DataLoader,
                cfg: ModelConfig, device: torch.device, checkpoint_dir: Path,
-               rng: np.random.Generator, hf_repo: str | None = None) -> None:
-    logger.info('===== Stage 2: Masking-recovery + soft contrastive (%d epochs) =====', cfg.stage2_epochs)
+               rng: np.random.Generator, hf_repo: str | None = None,
+               start_epoch: int = 0, resume_state: dict | None = None) -> None:
+    logger.info('===== Stage 2: Masking-recovery + soft contrastive (%d epochs%s) =====',
+                cfg.stage2_epochs,
+                f', resuming after epoch {start_epoch}' if start_epoch else '')
+    if start_epoch >= cfg.stage2_epochs:
+        logger.info('Stage 2 already complete (%d/%d epochs); skipping.',
+                    start_epoch, cfg.stage2_epochs)
+        return
     optimizer = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scheduler = CosineAnnealingLR(optimizer, T_max=cfg.stage2_epochs, eta_min=cfg.lr_min)
-    step = 0
-    best_val = float('inf')
+    best_val, step = _restore_train_state(optimizer, scheduler, resume_state,
+                                          start_epoch, expected_stage=2)
     patience_count = 0
 
-    for epoch in range(1, cfg.stage2_epochs + 1):
+    for epoch in range(start_epoch + 1, cfg.stage2_epochs + 1):
         model.train()
         total_loss = 0.0
         n_batches = 0
@@ -310,8 +405,10 @@ def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
             best_val = val_loss
             patience_count = 0
             torch.save(
-                {'epoch': epoch, 'model': model.state_dict(),
-                 'val_rec': best_val, 'cfg': dataclasses.asdict(cfg)},
+                {'epoch': epoch, 'stage': 2, 'model': model.state_dict(),
+                 'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(),
+                 'val_rec': best_val, 'best_val': best_val, 'step': step,
+                 'rng': _rng_state(), 'cfg': dataclasses.asdict(cfg)},
                  checkpoint_dir / 'best.pt'
             )
             logger.info('\tNew best model saved to %s', checkpoint_dir)
@@ -510,7 +607,7 @@ def train(cfg: ModelConfig, args: argparse.Namespace) -> None:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info('Device: %s', device)
 
-    # Enable TF32 matmul/conv on Ampere+ (A100) — free speedup, no accuracy concern here
+    # Enable TF32 matmul/conv on Ampere+ (A100)
     if device.type == 'cuda':
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -571,11 +668,33 @@ def train(cfg: ModelConfig, args: argparse.Namespace) -> None:
 
     rng = np.random.default_rng()
 
+    # ----- Resume handling -----
+    ckpt_file = getattr(args, 'checkpoint_file', None)
+    resume_s1 = getattr(args, 'resume_stage1', 0) or 0
+    resume_s2 = getattr(args, 'resume_stage2', 0) or 0
+    if (resume_s1 or resume_s2) and not ckpt_file:
+        raise ValueError('--resume-stage1/--resume-stage2 require --checkpoint-file')
+    ckpt = _load_checkpoint(model, ckpt_file, device) if ckpt_file else None
+
     # Two-stage training
     logger.info('Training: stage1=%d epochs | stage2=%d epochs | lr=%.1e | batch_size=%d',
                 cfg.stage1_epochs, cfg.stage2_epochs, cfg.lr, cfg.batch_size)
-    run_stage1(model, train_loader, val_loader, cfg, device, checkpoint_dir, hf_repo=hf_repo)
-    run_stage2(model, train_loader, val_loader, cfg, device, checkpoint_dir, rng, hf_repo=hf_repo)
+
+    if resume_s2:
+        # Resume mid-Stage-2: skip Stage 1 entirely, continue Stage 2 from epoch resume_s2,
+        # restoring optimizer/scheduler/RNG for an exact continuation.
+        logger.info('Resuming: skipping Stage 1, continuing Stage 2 after epoch %d', resume_s2)
+        run_stage2(model, train_loader, val_loader, cfg, device, checkpoint_dir, rng,
+                   hf_repo=hf_repo, start_epoch=resume_s2, resume_state=ckpt)
+    else:
+        # Fresh, warm-start (ckpt without resume → weights only), or resume mid-Stage-1.
+        # resume_state is only passed when actually resuming Stage 1, so a warm start
+        # does not pull a (possibly Stage-2) optimizer state into a fresh Stage 1.
+        run_stage1(model, train_loader, val_loader, cfg, device, checkpoint_dir,
+                   hf_repo=hf_repo, start_epoch=resume_s1,
+                   resume_state=ckpt if resume_s1 else None)
+        run_stage2(model, train_loader, val_loader, cfg, device, checkpoint_dir, rng,
+                   hf_repo=hf_repo)
     logger.info('Training complete. Best checkpoint: %s', checkpoint_dir / 'best.pt')
 
     # Single-stage training
@@ -636,7 +755,15 @@ def main():
     parser.add_argument('--no-semantics', action='store_true')
     parser.add_argument('--checkpoint-dir', default='checkpoints')
     parser.add_argument('--hf-repo', default=None, metavar='REPO_ID')
+    # Resume from a saved checkpoint. Provide --checkpoint-file plus exactly one
+    # of --resume-stage1 / --resume-stage2 (the number of epochs already done)
+    parser.add_argument('--checkpoint-file', default=None, metavar='PT')
+    parser.add_argument('--resume-stage1', type=int, default=0, metavar='N')
+    parser.add_argument('--resume-stage2', type=int, default=0, metavar='N')
     args = parser.parse_args()
+
+    if args.resume_stage1 and args.resume_stage2:
+        parser.error('Use only one of --resume-stage1 OR --resume-stage2.')
 
     cfg = ModelConfig(
         d_model=args.d_model,
