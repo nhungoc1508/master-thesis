@@ -679,12 +679,13 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
             domain_ids: torch.Tensor,
             e_sem: torch.Tensor | None,
             kin_group_masked: bool = False,
+            sem_group_masked: bool = False,
             e_traj_sem_detached: torch.Tensor | None = None
     ) -> dict:
         """Masking-recovery + soft contrastive regulariser + MoE load balancing"""
         out = self.forward(
             x_spatial, tau, kinematics, coords, pad_mask, pos_mask,
-            domain_ids, e_sem, kin_group_masked
+            domain_ids, e_sem, kin_group_masked, sem_group_masked
         )
         loss_recovery = out['loss']
         lb_loss = out['loss_balance']
@@ -692,8 +693,13 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         total = loss_recovery + self.cfg.moe_lambda * lb_loss
 
         if e_traj_sem_detached is not None:
+            # Anchor the BARE backbone (apply_g=False, no e_sem) — exactly the
+            # representation Stage 1 aligned. Passing e_sem through g here would
+            # let g read the semantic embeddings directly and make the contrastive
+            # match trivial (leakage), collapsing the regulariser toward 0.
             z_traj = self.trajectory_embedding(
-                x_spatial, tau, kinematics, coords, pad_mask, domain_ids, e_sem
+                x_spatial, tau, kinematics, coords, pad_mask, domain_ids,
+                e_sem=None, apply_g=False
             )
             loss_ctr = self.info_nce(z_traj, e_traj_sem_detached, detach_e=True)
             total = total + self.cfg.contrastive_lambda * loss_ctr

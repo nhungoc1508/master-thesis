@@ -342,7 +342,7 @@ def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
             coords = batch['coords'].to(device)
             pad_mask = batch['pad_mask'].to(device)
             domain_ids = _domain_ids(batch, device)
-            pos_mask, kin_masked, _ = make_masks(batch, mode, cfg.max_len, device)
+            pos_mask, kin_masked, sem_masked = make_masks(batch, mode, cfg.max_len, device)
             e_sem = batch.get('e_sem')
             if e_sem is not None:
                 e_sem = e_sem.to(device)
@@ -355,7 +355,7 @@ def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
 
             out = model.forward_stage2(
                 x_spatial, tau, kin, coords, pad_mask, pos_mask, domain_ids,
-                e_sem, kin_masked, e_traj_det
+                e_sem, kin_masked, sem_masked, e_traj_det
             )
             loss = out['loss']
             optimizer.zero_grad()
@@ -385,13 +385,13 @@ def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
                 coords = batch['coords'].to(device)
                 pad_mask = batch['pad_mask'].to(device)
                 domain_ids = _domain_ids(batch, device)
-                pos_mask, kin_masked, _ = make_masks(batch, mode, cfg.max_len, device)
+                pos_mask, kin_masked, sem_masked = make_masks(batch, mode, cfg.max_len, device)
                 e_sem = batch.get('e_sem')
                 if e_sem is not None:
                     e_sem = e_sem.to(device)
                 out = model.forward_stage2(
                     x_spatial, tau, kin, coords, pad_mask, pos_mask, domain_ids,
-                    e_sem, kin_masked
+                    e_sem, kin_masked, sem_masked
                 )
                 val_loss += out['loss_recovery'].item()
                 n_val += 1
