@@ -139,7 +139,7 @@ class TrajectoryDataset(Dataset):
             for s, e in zip(starts.tolist(), ends.tolist()):
                 if e - s < 2:
                     continue
-                d_lat, d_lon, d_t, _, _ = normalize_trajectory(
+                d_lat, d_lon, d_t, bbox_half, log_max_dt = normalize_trajectory(
                     lat_all[s:e], lon_all[s:e], ts_all[s:e]
                 )
                 coords = np.stack([d_lat, d_lon], axis=1).astype(np.float32)
@@ -151,6 +151,13 @@ class TrajectoryDataset(Dataset):
                     'kin': kin_all[s:e].copy() if kin_all is not None else None,
                     'abs_rows': abs_all[s:e].copy(),
                     'traj_id': str(tid[s]),
+                    'denorm': {
+                        'bbox_half': float(bbox_half),
+                        'lat0': float(lat_all[s]),
+                        'lon0': float(lon_all[s]),
+                        't0': float(ts_all[s]),
+                        'log_max_dt': float(log_max_dt),
+                    },
                 })
                 self._sem_memmaps.append(sem_mm)
 
