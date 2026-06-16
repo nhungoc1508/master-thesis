@@ -85,7 +85,7 @@ def freeze_one(parquet: Path, sem_dir: str | None, domain: str, args) -> None:
     sem_path = _sem_for(parquet, sem_dir, domain)
     ds = TrajectoryDataset(
         [parquet], domain=domain, max_len=args.max_len, input_dim=args.input_dim,
-        sem_npy_path=[sem_path], include_kinematics=True
+        sem_npy_paths=[sem_path], include_kinematics=True
     )
     N = len(ds)
     if N == 0:
