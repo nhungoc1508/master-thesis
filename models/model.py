@@ -445,8 +445,12 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         # Output head: d -> 6
         self.output_head = nn.Linear(d, cfg.input_dim)
 
-        # Learned [MASK] token
-        self.mask_token = nn.Parameter(torch.randn(d) * 0.02)
+        # Learned [MASK_SPATIAL] token (d/2): replaces ONLY the spatial half of a
+        # masked point's embedding. The temporal half Fourier(tau) is KEPT so the
+        # masked point retains a distinct localization anchor; kinematics are zeroed.
+        # This prevents the collapse where all masked points share an identical embedding
+        # -> identical output
+        self.mask_spatial = nn.Parameter(torch.randn(d // 2) * 0.02)
 
         self._layer_norm_emb = nn.LayerNorm(d)
 
@@ -455,16 +459,30 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         # nn.init.zeros_(self.W_sem_pred.weight)
 
     def _embed(self, x_spatial: torch.Tensor, tau: torch.Tensor, kinematics: torch.Tensor,
-               domain_ids: torch.Tensor) -> torch.Tensor:
+               domain_ids: torch.Tensor, pos_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Build per-point token embeddings
+
+        If pos_mask is given, masked positions have their SPATIAL content replaced
+        by the learned [MASK_SPATIAL] token and their kinematics zeroed, but their
+        TEMPORAL embedding Fourier(tau) and domain are KEPT. Temporal information
+        (day/hour/minute/d_t) does not reveal lat/lon, so it is a legitimate query
+        anchor, and it gives each masked point a distinct identity, so the model
+        can reconstruct 'the position at time t' instead of collapsing every
+        masked point to the same (centroid) prediction
+        """
         e_s = self.W_s(x_spatial)
         e_t = self.fourier_enc(tau)
-        e_st = torch.cat([e_s, e_t], dim=-1)
+        e_kin = self.W_kin(kinematics)
 
-        # Add kinematic contribution
-        e_kin = self.W_kin(kinematics)           # (B, L, d)
+        if pos_mask is not None:
+            m = pos_mask.unsqueeze(-1)
+            e_s = torch.where(m, self.mask_spatial.view(1, 1, -1).to(e_s.dtype), e_s)
+            e_kin = torch.where(m, torch.zeros_like(e_kin), e_kin)
+
+        e_st = torch.cat([e_s, e_t], dim=-1)
         e = e_st + e_kin
 
-        # Domain embedding (broadcast over L)
         e_dom = self.E_dom(domain_ids).unsqueeze(1)  # (B, 1, d)
         e = self._layer_norm_emb(e + e_dom)
 
@@ -567,17 +585,18 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
 
         # Full forward (handles spatial masking, kin_unk, g cross-attention)
 
-        # Target: [Δlat, Δlon, Δt_norm, speed_n, heading_n, turn_n]
+        # Target: [d_lat, d_lon, d_t_norm, speed_n, heading_n, turn_n]
         target = torch.cat([x_spatial, tau[..., 3:4], kinematics], dim=-1)
         # Mask kinematic group if needed
         kin = self._apply_kin_unk(kinematics, kin_group_masked)
-        e = self._embed(x_spatial, tau, kin, domain_ids)
-        
+        # Content masking happens INSIDE _embed: at masked positions the spatial
+        # half -> [MASK_SPATIAL] and kinematics -> 0, but the temporal embedding
+        # Fourier(tau) is kept as the per-point localization anchor
+        e = self._embed(x_spatial, tau, kin, domain_ids, pos_mask=pos_mask)
+
         if pos_mask is not None:
-            # Mask whole position (spatial - tau - kin - domain)
-            mask_tok = self.mask_token.view(1, 1, -1).expand(B, L, -1)
-            e = torch.where(pos_mask.unsqueeze(-1), mask_tok, e)
-            # Mask coordinates (for RoPE)
+            # Mask coordinates for STRPE (prevent spatial leakage via the rotary
+            # angles). tau (kept in the embedding) is the anchor instead
             mask_coords_tok = self.mask_coords.view(1, 1, 2).expand(B, L, 2)
             coords_input = torch.where(pos_mask.unsqueeze(-1), mask_coords_tok, coords)
         else:
@@ -604,9 +623,15 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         if pos_mask is not None:
             real_masked = pos_mask & ~pad_mask
             if real_masked.any():
-                out['loss'] = ((pred[real_masked] - target[real_masked]) ** 2).mean()
+                diff2 = (pred[real_masked] - target[real_masked]) ** 2
+                out['loss'] = diff2.mean()
+                # Per-dimension recovery MSE [d_lat, d_lon, d_t, speed, heading, turn]
+                # lets training surface spatial vs. temporal vs. kinematic error
+                # separately instead of hiding it in the 6-dim average
+                out['loss_per_dim'] = diff2.mean(dim=0).detach()
             else:
                 out['loss'] = torch.tensor(0.0, device=x_spatial.device)
+                out['loss_per_dim'] = torch.zeros(pred.shape[-1], device=x_spatial.device)
 
         # loss_recovery = out['loss']
         # loss_sem_pred = torch.tensor(0.0, device=x_spatial.device)

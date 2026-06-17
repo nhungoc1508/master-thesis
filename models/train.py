@@ -110,6 +110,17 @@ def _kinematics(batch: dict, device: torch.device) -> torch.Tensor:
     B, L = batch['x'].shape[:2]
     return torch.zeros(B, L, 3, device=device)
 
+def _group_per_dim(per_dim: torch.Tensor) -> tuple[float, float, float]:
+    """
+    Group per-dimension recovery MSE [d_lat, d_lon, d_t, speed, heading, turn]
+    into (spatial, temporal, kinematic) scalar MSEs for logging
+    """
+    pd = per_dim.detach().cpu()
+    spatial = pd[:2].mean().item()
+    temporal = pd[2].item() if pd.numel() > 2 else 0.0
+    kinematic = pd[3:].mean().item() if pd.numel() > 3 else 0.0
+    return spatial, temporal, kinematic
+
 # ========== HuggingFace checkpoint backup ==========
 
 def _ensure_hf_repo(repo_id: str) -> None:
@@ -331,6 +342,7 @@ def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
         model.train()
         total_loss = 0.0
         n_batches = 0
+        pd_sum = torch.zeros(cfg.input_dim) # accumulate per-dim recovery MSE
         for batch in train_loader:
             domain_str = _batch_domain_str(batch)
             mode = sample_mode(domain_str, rng)
@@ -365,14 +377,20 @@ def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
             total_loss += loss.item()
             n_batches += 1
             step += 1
+            if 'loss_per_dim' in out:
+                pd_sum += out['loss_per_dim'].detach().cpu()
             if step % cfg.log_every == 0:
-                logger.info('\tStage 2: step=%d | loss=%.8f | rec=%.8f | ctr=%.8f',
+                sp, tp, kn = _group_per_dim(out.get('loss_per_dim', torch.zeros(cfg.input_dim)))
+                logger.info('\tStage 2: step=%d | loss=%.6f | rec=%.6f | ctr=%.6f | lb=%.6f '
+                            '|| rec[spatial=%.6f temporal=%.6f kin=%.6f]',
                             step, loss.item(), out['loss_recovery'].item(),
-                            out['loss_contrastive'].item())
+                            out['loss_contrastive'].item(), out['loss_balance'].item(),
+                            sp, tp, kn)
 
         model.eval()
         val_loss = 0.0
         n_val = 0
+        val_pd_sum = torch.zeros(cfg.input_dim)
         with torch.no_grad():
             for batch in val_loader:
                 domain_str = _batch_domain_str(batch)
@@ -394,12 +412,19 @@ def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
                     e_sem, kin_masked, sem_masked
                 )
                 val_loss += out['loss_recovery'].item()
+                if 'loss_per_dim' in out:
+                    val_pd_sum += out['loss_per_dim'].detach().cpu()
                 n_val += 1
 
         val_loss /= max(n_val, 1)
         scheduler.step()
-        logger.info('Stage 2: epoch %3d/%d | train=%.8f | val_rec=%.8f',
-                    epoch, cfg.stage2_epochs, total_loss / max(n_batches, 1), val_loss)
+        tr_sp, tr_tp, tr_kn = _group_per_dim(pd_sum / max(n_batches, 1))
+        va_sp, va_tp, va_kn = _group_per_dim(val_pd_sum / max(n_val, 1))
+        logger.info('Stage 2: epoch %3d/%d | train=%.6f | val_rec=%.6f', epoch,
+                    cfg.stage2_epochs, total_loss / max(n_batches, 1), val_loss)
+        logger.info('\ttrain rec[spatial=%.6f temporal=%.6f kin=%.6f] | '
+                    'val rec[spatial=%.6f temporal=%.6f kin=%.6f]',
+                    tr_sp, tr_tp, tr_kn, va_sp, va_tp, va_kn)
 
         if val_loss < best_val:
             best_val = val_loss
