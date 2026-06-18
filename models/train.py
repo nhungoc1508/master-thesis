@@ -240,7 +240,7 @@ def _restore_train_state(optimizer, scheduler, resume_state: dict | None,
 def run_stage1(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val_loader: DataLoader,
                cfg: ModelConfig, device: torch.device, checkpoint_dir: Path,
                hf_repo: str | None = None, start_epoch: int = 0,
-               resume_state: dict | None = None) -> None:
+               resume_state: dict | None = None, ckpt_name: str = 'stage1_best.pt') -> None:
     logger.info('===== Stage 1: Contrastive learning (%d epochs%s) =====', cfg.stage1_epochs,
                 f', resuming after epoch {start_epoch}' if start_epoch else '')
     if start_epoch >= cfg.stage1_epochs:
@@ -313,18 +313,19 @@ def run_stage1(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
                  'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(),
                  'best_val': best_val, 'step': step, 'rng': _rng_state(),
                  'cfg': dataclasses.asdict(cfg)},
-                 checkpoint_dir / 'stage1_best.pt'
+                 checkpoint_dir / ckpt_name
             )
-            logger.info('\tNew best model saved to %s', checkpoint_dir)
+            logger.info('\tNew best model saved to %s', checkpoint_dir / ckpt_name)
             if hf_repo:
-                _hf_upload_checkpoint(checkpoint_dir / 'stage1_best.pt', hf_repo)
+                _hf_upload_checkpoint(checkpoint_dir / ckpt_name, hf_repo)
 
     logger.info('Stage 1 complete; best val: %.8f', best_val)
 
 def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val_loader: DataLoader,
                cfg: ModelConfig, device: torch.device, checkpoint_dir: Path,
                rng: np.random.Generator, hf_repo: str | None = None,
-               start_epoch: int = 0, resume_state: dict | None = None) -> None:
+               start_epoch: int = 0, resume_state: dict | None = None,
+               ckpt_name: str = 'best.pt') -> None:
     logger.info('===== Stage 2: Masking-recovery + soft contrastive (%d epochs%s) =====',
                 cfg.stage2_epochs,
                 f', resuming after epoch {start_epoch}' if start_epoch else '')
@@ -434,11 +435,11 @@ def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
                  'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(),
                  'val_rec': best_val, 'best_val': best_val, 'step': step,
                  'rng': _rng_state(), 'cfg': dataclasses.asdict(cfg)},
-                 checkpoint_dir / 'best.pt'
+                 checkpoint_dir / ckpt_name
             )
-            logger.info('\tNew best model saved to %s', checkpoint_dir)
+            logger.info('\tNew best model saved to %s', checkpoint_dir / ckpt_name)
             if hf_repo:
-                _hf_upload_checkpoint(checkpoint_dir / 'best.pt', hf_repo)
+                _hf_upload_checkpoint(checkpoint_dir / ckpt_name, hf_repo)
         else:
             patience_count += 1
             if patience_count >= cfg.patience:
@@ -693,6 +694,12 @@ def train(cfg: ModelConfig, args: argparse.Namespace) -> None:
 
     rng = np.random.default_rng()
 
+    run_name = getattr(args, 'run_name', None)
+    stage1_ckpt = f'{run_name}_stage1_best.pt' if run_name else 'stage1_best.pt'
+    stage2_ckpt = f'{run_name}_best.pt' if run_name else 'best.pt'
+    if run_name:
+        logger.info('Run name: %s -> checkpoints %s / %s', run_name, stage1_ckpt, stage2_ckpt)
+
     # ----- Resume handling -----
     ckpt_file = getattr(args, 'checkpoint_file', None)
     resume_s1 = getattr(args, 'resume_stage1', 0) or 0
@@ -710,17 +717,18 @@ def train(cfg: ModelConfig, args: argparse.Namespace) -> None:
         # restoring optimizer/scheduler/RNG for an exact continuation.
         logger.info('Resuming: skipping Stage 1, continuing Stage 2 after epoch %d', resume_s2)
         run_stage2(model, train_loader, val_loader, cfg, device, checkpoint_dir, rng,
-                   hf_repo=hf_repo, start_epoch=resume_s2, resume_state=ckpt)
+                   hf_repo=hf_repo, start_epoch=resume_s2, resume_state=ckpt,
+                   ckpt_name=stage2_ckpt)
     else:
         # Fresh, warm-start (ckpt without resume → weights only), or resume mid-Stage-1.
         # resume_state is only passed when actually resuming Stage 1, so a warm start
         # does not pull a (possibly Stage-2) optimizer state into a fresh Stage 1.
         run_stage1(model, train_loader, val_loader, cfg, device, checkpoint_dir,
                    hf_repo=hf_repo, start_epoch=resume_s1,
-                   resume_state=ckpt if resume_s1 else None)
+                   resume_state=ckpt if resume_s1 else None, ckpt_name=stage1_ckpt)
         run_stage2(model, train_loader, val_loader, cfg, device, checkpoint_dir, rng,
-                   hf_repo=hf_repo)
-    logger.info('Training complete. Best checkpoint: %s', checkpoint_dir / 'best.pt')
+                   hf_repo=hf_repo, ckpt_name=stage2_ckpt)
+    logger.info('Training complete. Best checkpoint: %s', checkpoint_dir / stage2_ckpt)
 
     # Single-stage training
     # logger.info('Training for %d epochs  lr=%.1e  batch_size=%d',
@@ -779,6 +787,7 @@ def main():
     parser.add_argument('--alpha', type=float, default=0.05)
     parser.add_argument('--no-semantics', action='store_true')
     parser.add_argument('--checkpoint-dir', default='checkpoints')
+    parser.add_argument('--run-name', default=None, metavar='NAME')
     parser.add_argument('--hf-repo', default=None, metavar='REPO_ID')
     # Resume from a saved checkpoint. Provide --checkpoint-file plus exactly one
     # of --resume-stage1 / --resume-stage2 (the number of epochs already done)
