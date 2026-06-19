@@ -660,18 +660,23 @@ def train(cfg: ModelConfig, args: argparse.Namespace) -> None:
         base = Path(p)
         return sorted(base.glob('**/*.parquet')) if base.is_dir() else [base]
 
+    has_urban = bool(_paths(args.urban_train))
+    has_maritime = bool(_paths(args.maritime_train))
+    if not (has_urban or has_maritime):
+        raise ValueError('No training data: provide --urban-train and/or --maritime-train')
+
     urban_train_loader = build_loader(
         _paths(args.urban_train), 'urban', args.urban_sem_npy or [], cfg, True
-    )
+    ) if has_urban else None
     maritime_train_loader = build_loader(
         _paths(args.maritime_train), 'maritime', args.maritime_sem_npy or [], cfg, True
-    )
+    ) if has_maritime else None
     urban_val_loader = build_loader(
         _paths(args.urban_val), 'urban', args.urban_val_sem_npy or [], cfg, False
-    )
+    ) if has_urban else None
     maritime_val_loader = build_loader(
         _paths(args.maritime_val), 'maritime', args.maritime_val_sem_npy or [], cfg, False
-    )
+    ) if has_maritime else None
 
     class InterleavedLoader:
         """Alternate urban and maritime batches"""
@@ -681,12 +686,21 @@ def train(cfg: ModelConfig, args: argparse.Namespace) -> None:
 
         def __iter__(self):
             return chain.from_iterable(zip(self.a, self.b))
-        
+
         def __len__(self):
             return min(len(self.a), len(self.b)) * 2
 
-    train_loader = InterleavedLoader(urban_train_loader, maritime_train_loader)
-    val_loader   = InterleavedLoader(urban_val_loader,   maritime_val_loader)
+    def _combine(a, b):
+        """Interleave both domains, or pass through the single active loader."""
+        if a is not None and b is not None:
+            return InterleavedLoader(a, b)
+        return a if a is not None else b
+
+    train_loader = _combine(urban_train_loader, maritime_train_loader)
+    val_loader = _combine(urban_val_loader, maritime_val_loader)
+    mode_str = ('cross-domain' if (has_urban and has_maritime)
+                else 'urban-only' if has_urban else 'maritime-only')
+    logger.info('Training mode: %s', mode_str)
     logger.info('Train batches/epoch: %d  |  Val batches/epoch: %d',
                 len(train_loader), len(val_loader))
 
