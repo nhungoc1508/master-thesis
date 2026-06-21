@@ -135,17 +135,38 @@ def _process_one(csv_file: Path, base_dir: Path, cfg: dict) -> None:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('raw_dir')
+    parser.add_argument('raw_dir', nargs='?', default=None)
+    parser.add_argument('--input-csv', default=None)
     parser.add_argument('--base-dir', default=None)
     parser.add_argument('--config', default='config/pipeline_config.yaml')
     parser.add_argument('--resume', action='store_true')
     args = parser.parse_args()
 
+    if not args.raw_dir and not args.input_csv:
+        parser.error('Provide either RAW_DIR (aisdk-[date] layout) or --input-csv PATH.')
+
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    raw_dir  = Path(args.raw_dir)
     base_dir = Path(args.base_dir) if args.base_dir else Path(__file__).parent
+
+    # ----- Single-file mode (bypasses aisdk-[date] discovery; e.g., NOAA US) -----
+    if args.input_csv:
+        csv_file = Path(args.input_csv)
+        if not csv_file.is_file():
+            logger.error('--input-csv not found: %s', csv_file)
+            sys.exit(1)
+        logger.info('Single-file mode: %s', csv_file)
+        try:
+            _process_one(csv_file, base_dir, cfg)
+            logger.info('Completed %s', csv_file.stem)
+        except Exception:
+            logger.exception('Failed for %s', csv_file.stem)
+            sys.exit(1)
+        return
+
+    # ----- Directory mode (DMA aisdk-[date] layout) -----
+    raw_dir  = Path(args.raw_dir)
 
     subdirs = sorted(
         d for d in raw_dir.iterdir()

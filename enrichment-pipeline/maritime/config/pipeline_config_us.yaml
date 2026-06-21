@@ -1,0 +1,92 @@
+# US (NOAA) AIS pipeline config. Mirrors pipeline_config.yaml (DMA), differing in:
+#   - US column schema; Class A/B selected via TransceiverClass
+#   - US-specific value cleaning (sentinel nulling + numeric nav-status)
+#   - region context layers re-sourced for US waters -> data/context_us/
+#   - global layers (EEZ, IHO seas, GEBCO, Copernicus) reused unchanged -> data/context/
+# Annotation (Archimedes) is region-agnostic and reuses the same binary + params.json.
+archimedes:
+  annotation_binary: /home/ubuntu/thesis/Archimedes-new/AIS-trajectory-annotation/src/annotate
+  python_src: /home/ubuntu/thesis/Archimedes-new/AIS-semantic-trajectories/src
+  params_json: /home/ubuntu/thesis/Archimedes-new/AIS-trajectory-annotation/test/settings/params.json
+
+ingest:
+  source: us
+  ts_format: '%Y-%m-%dT%H:%M:%S'
+  mobile_type_filter: ['A', 'B']
+  # Canonical (post-rename) names; ingest renames the US originals before forward-fill
+  forward_fill_cols:
+    - Name
+    - Ship type
+    - Draught
+    - Length
+    - Width
+  raw_columns:
+    # Used before the US->canonical rename -> keep US source names
+    mmsi:        MMSI
+    timestamp:   BaseDateTime
+    lat:         LAT
+    lon:         LON
+    sog:         SOG
+    cog:         COG
+    heading:     Heading
+    length:      Length
+    width:       Width
+    mobile_type: TransceiverClass
+    # Renamed to DMA canonical by ingest (source: us) -> reference canonical names
+    nav_status:  Navigational status
+    ship_type:   Ship type
+    draught:     Draught
+    name:        Name
+
+annotate:
+  annotated_only: false
+  id_col: 1
+  ts_col: 4
+
+segment:
+  min_gap_size: 3600
+  min_points: 20
+  min_duration_s: 300          # 5 minutes
+  min_displacement_nm: 0.5     # 0.5 nautical miles
+
+enrich:
+  stop_speed_kn: 0.5
+  slow_speed_kn: 3.0
+
+  context:
+    # Region-clipped layers: RE-SOURCED for US waters
+    ports_csv: data/context_us/ports.csv
+    # OSM island/cape/strait/peninsula shapefiles
+    placemarks_shp: data/context_us/osm_places.shp
+    capes_shp: data/context_us/osm_capes.shp
+    # OSM protection zones (Marine Protected Areas)
+    protected_areas_shp: data/context_us/osm_protected_areas.shp
+    # OSM Traffic Separation Schemes
+    separation_zones_shp: data/context_us/osm_separation.shp
+    # OSM harbour area polygons
+    harbour_polygons_shp: data/context_us/osm_harbours.shp
+    # VLIZ World EEZ v12 GeoPackage
+    eez_gpkg: data/context/World_EEZ_v12_20231025_gpkg/eez_v12.gpkg
+    # VLIZ IHO Sea Areas shapefile
+    sea_areas_shp: data/context/World_Seas_IHO_v3/World_Seas_IHO_v3.shp
+    # GEBCO 2026 bathymetry NetCDF
+    gebco_nc_dir: data/context/gebco/
+
+  port_proximity:
+    berthed_nm: 0.5      # within 0.5 NM + inside harbour polygon -> berthed
+    approach_nm: 5.0     # within 5 NM of WPI centroid -> port_approach
+    coastal_nm: 20.0     # within 20 NM -> coastal; beyond -> offshore
+
+  # Ocean enrichment via copernicusmarine
+  ocean:
+    wave_dataset: cmems_mod_glo_wav_my_0.2deg_PT3H-i
+    wave_variable: VHM0
+    current_dataset: cmems_mod_glo_phy_my_0.083deg_P1D-m
+    current_variables: [uo, vo]
+    cache_dir: data/ocean_cache/
+    batch_days: 7
+    bbox_buffer_deg: 1.0
+
+canonicalize:
+  # Resample to one point per interval using floor-bucket selection
+  interval_s: 60 # 1 minute

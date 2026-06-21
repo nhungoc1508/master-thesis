@@ -178,8 +178,31 @@ def _bearing_to_cardinal(deg) -> str:
     except (TypeError, ValueError):
         return 'unknown'
     
+_NAV_STATUS_CODES: dict[int, str] = {
+    0: 'under way using engine',
+    1: 'at anchor',
+    2: 'not under command',
+    3: 'restricted manoeuvrability',
+    4: 'constrained by her draught',
+    5: 'moored',
+    6: 'aground',
+    7: 'engaged in fishing',
+    8: 'under way sailing',
+    9: 'reserved for high speed craft',
+    10: 'reserved for wing in ground',
+    11: 'power-driven vessel towing astern',
+    12: 'power-driven vessel pushing ahead',
+    14: 'AIS-SART / MOB / EPIRB',
+    15: 'undefined',
+}
+
 def _nav_status_text(nav) -> str | None:
+    if nav is None:
+        return None
     text = str(nav).strip().lower()
-    if text and text not in ('nan', 'none', ''):
+    if not text or text in ('nan', 'none', ''):
+        return None
+    try:
+        return _NAV_STATUS_CODES.get(int(float(text)), text)
+    except (TypeError, ValueError):
         return text
-    return None

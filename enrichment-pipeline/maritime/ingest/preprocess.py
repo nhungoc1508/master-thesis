@@ -81,6 +81,26 @@ _TEXT_TO_ARCHIMEDES_TYPE: dict[str, str] = {
     'not party to conflict': 'Default',
 }
 
+# AIS navigational-status codes (ITU-R M.1371). NOAA encodes these numerically;
+# mapped to DMA-style text at ingest so the text-keyed phase classifier works.
+_US_NAV_STATUS: dict[int, str] = {
+    0: 'under way using engine',
+    1: 'at anchor',
+    2: 'not under command',
+    3: 'restricted manoeuvrability',
+    4: 'constrained by her draught',
+    5: 'moored',
+    6: 'aground',
+    7: 'engaged in fishing',
+    8: 'under way sailing',
+    9: 'reserved for high speed craft',
+    10: 'reserved for wing in ground',
+    11: 'power-driven vessel towing astern',
+    12: 'power-driven vessel pushing ahead',
+    14: 'AIS-SART / MOB / EPIRB',
+    15: 'undefined',
+}
+
 def _itu_to_type(code) -> str:
     """Map a Ship_type value (code or label) to an Archimedes type string"""
     if code is None:
@@ -109,6 +129,8 @@ def run(raw_csv: Path | str, output_dir: Path | str, cfg: dict) -> tuple[Path, P
     raw_cols = ingest_cfg.get('raw_columns', {})
     mobile_filter = ingest_cfg.get('mobile_type_filter')
     fill_cols = ingest_cfg.get('forward_fill_cols', _DEFAULT_FILL_COLS)
+    source = ingest_cfg.get('source', 'dma').lower()
+    ts_format = ingest_cfg.get('ts_format', '%Y-%m-%d %H:%M:%S')
 
     # Map config column names to actual .csv column names
     col_mmsi = raw_cols.get('mmsi', 'MMSI')
@@ -154,6 +176,53 @@ def run(raw_csv: Path | str, output_dir: Path | str, cfg: dict) -> tuple[Path, P
         """)
     con.execute('DROP TABLE raw')
 
+    # ========== US-specific: null AIS "not available" sentinels ==========
+    # DMA leaves these blank; NOAA encodes the ITU sentinels numerically:
+    #   SOG 102.3 (=1023, 0.1 kn) | COG 360.0 (=3600, 0.1 deg) | Heading 511
+    if source == 'us':
+        avail = {row[0] for row in con.execute('DESCRIBE filtered').fetchall()}
+        col_sog = raw_cols.get('sog', 'SOG')
+        col_cog = raw_cols.get('cog', 'COG')
+        col_head = raw_cols.get('heading', 'Heading')
+        if col_sog in avail:
+            con.execute(f'UPDATE filtered SET "{col_sog}" = NULL WHERE "{col_sog}" >= 102.3')
+        if col_cog in avail:
+            con.execute(f'UPDATE filtered SET "{col_cog}" = NULL WHERE "{col_cog}" >= 360.0')
+        if col_head in avail:
+            con.execute(f'UPDATE filtered SET "{col_head}" = NULL '
+                        f'WHERE "{col_head}" = 511 OR "{col_head}" > 359')
+        logger.info('US sentinel cleaning: nulled SOG/COG/Heading not-available codes')
+
+    # US-specific: normalize column names to the DMA canonical set
+    if source == 'us':
+        us_rename = {
+            'Status':     'Navigational status',
+            'Draft':      'Draught',
+            'VesselType': 'Ship type',
+            'VesselName': 'Name',
+        }
+        avail = {row[0] for row in con.execute('DESCRIBE filtered').fetchall()}
+        for src_name, canon in us_rename.items():
+            if src_name in avail and canon not in avail:
+                con.execute(f'ALTER TABLE filtered RENAME COLUMN "{src_name}" TO "{canon}"')
+        logger.info('US column normalization: Status/Draft/VesselType/VesselName '
+                    '-> DMA canonical names')
+
+        if 'Navigational status' in {row[0] for row in
+                                     con.execute('DESCRIBE filtered').fetchall()}:
+            nav_case = '\n'.join(f"                    WHEN {code} THEN '{txt}'"
+                                 for code, txt in _US_NAV_STATUS.items())
+            con.execute(f"""
+                CREATE OR REPLACE TABLE filtered AS
+                SELECT * EXCLUDE ("Navigational status"),
+                    CASE TRY_CAST("Navigational status" AS INTEGER)
+{nav_case}
+                        ELSE NULL
+                    END AS "Navigational status"
+                FROM filtered
+            """)
+            logger.info('US nav-status codes mapped to text')
+
     # ========== Parse timestamp to Unix epoch seconds ==========
     con.execute(f"""
         CREATE OR REPLACE TABLE with_epoch AS
@@ -161,9 +230,11 @@ def run(raw_csv: Path | str, output_dir: Path | str, cfg: dict) -> tuple[Path, P
             CASE
                 WHEN typeof("{col_ts}") IN ('BIGINT','INTEGER','HUGEINT')
                     THEN CAST("{col_ts}" AS BIGINT)
+                WHEN typeof("{col_ts}") LIKE 'TIMESTAMP%'
+                    THEN CAST(epoch("{col_ts}") AS BIGINT)
                 ELSE
                     CAST(epoch(strptime(CAST("{col_ts}" AS VARCHAR),
-                        '%Y-%m-%d %H:%M:%S')) AS BIGINT)
+                        '{ts_format}')) AS BIGINT)
             END AS ts_unix
         FROM filtered
     """)
