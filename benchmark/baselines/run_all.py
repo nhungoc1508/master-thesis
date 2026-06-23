@@ -57,7 +57,7 @@ def main():
     ap.add_argument('--device', default=None)
     ap.add_argument('--epochs', type=int, default=None)
     ap.add_argument('--include', nargs='*', default=None)
-    ap.add_argument('--skip', nargs='*', default=['trajcl'])
+    ap.add_argument('--skip', nargs='*')
     ap.add_argument('--out', default='baseline_results.json')
     args = ap.parse_args()
 
@@ -103,7 +103,6 @@ def main():
             else:
                 print(f"  {name:14s} {r.get('status')}")
     print(f"\nWrote consolidated results -> {args.out}")
-    print("(FM scored separately via test_tfm.py — same frozen masks + metric.)")
 
 if __name__ == '__main__':
     main()
