@@ -76,6 +76,8 @@ def main():
     ap.add_argument('--probe-epochs', type=int, default=None)
     ap.add_argument('--node2vec-epochs', type=int, default=None) # trajcl only
     ap.add_argument('--node2vec-batch', type=int, default=None) # trajcl only
+    ap.add_argument('--node2vec-num-neg', type=int, default=None) # trajcl only; 5 ~halves node2vec cost
+    ap.add_argument('--node2vec-walks', type=int, default=None) # trajcl only; walks_per_node
     ap.add_argument('--out', default='baseline_results.json')
     args = ap.parse_args()
 
@@ -123,6 +125,10 @@ def main():
                     cmd += ['--node2vec-epochs', str(args.node2vec_epochs)]
                 if args.node2vec_batch is not None:
                     cmd += ['--node2vec-batch', str(args.node2vec_batch)]
+                if args.node2vec_num_neg is not None:
+                    cmd += ['--node2vec-num-neg', str(args.node2vec_num_neg)]
+                if args.node2vec_walks is not None:
+                    cmd += ['--node2vec-walks', str(args.node2vec_walks)]
         print(f">>> [{quad}] {name}: {' '.join(cmd)}", flush=True)
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, bufsize=1)

@@ -88,7 +88,7 @@ def pretrain(model, groups, spaces, cfg, device):
         np.random.shuffle(batches)
         tot = nb = 0.0
         for dsname, trajs in batches:
-            cellspace, embs = spaces[dsname]
+            cellspace, embs = spaces[adapt.region_key(dsname)]
             batch = collate_and_augment(trajs, cellspace, embs, aug1, aug2)
             logits, targets = model(*batch)
             loss = model.loss(logits, targets)
@@ -135,7 +135,7 @@ def train_probe(model, head, recs, spaces, cfg, device, finetune):
         np.random.shuffle(batches)
         tot = nb = 0.0
         for dsname, batch in batches:
-            cellspace, embs = spaces[dsname]
+            cellspace, embs = spaces[adapt.region_key(dsname)]
             z = _embed(model, cellspace, embs, [r['prefix'] for r in batch], device, no_grad=not finetune)
             loss = 0.0
             for j, r in enumerate(batch):
@@ -156,7 +156,7 @@ def evaluate(model, head, recs, spaces, device):
     for r in recs:
         groups[r['item']['dataset']].append(r)
     for dsname, rs in groups.items():
-        cellspace, embs = spaces[dsname]
+        cellspace, embs = spaces[adapt.region_key(dsname)]
         z = _embed(model, cellspace, embs, [r['prefix'] for r in rs], device, no_grad=True)
         for j, r in enumerate(rs):
             it = r['item']; tlen = r['tlen']; M = r['target'].shape[0]
@@ -187,6 +187,9 @@ def main():
     ap.add_argument('--node2vec-epochs', type=int, default=20) # node2vec cell-embedding pretraining
     ap.add_argument('--node2vec-batch', type=int, default=256) # loss mem ~ batch*walks*walk_len*num_neg*dim; 256 fits, 32 is overhead-bound
     ap.add_argument('--node2vec-workers', type=int, default=8)
+    ap.add_argument('--node2vec-num-neg', type=int, default=10) # repo 10; 5 ~halves cost (speed lever)
+    ap.add_argument('--node2vec-walks', type=int, default=10) # walks_per_node; repo 10
+    ap.add_argument('--node2vec-walk-length', type=int, default=50)  # repo 50
     ap.add_argument('--pretrain-epochs', type=int, default=15)
     ap.add_argument('--probe-epochs', type=int, default=15)
     ap.add_argument('--batch', type=int, default=64)
@@ -216,12 +219,15 @@ def main():
         for k, v in a.items():
             setattr(args, k, v)
         set_config(args, device)
-        spaces = {}
+        region_pts = defaultdict(list) # one grid per region (split suffix stripped)
         for dsname, g in test_groups.items():
-            cellspace = adapt.build_cellspace(g['trajs'], args.cell_size)
-            embs = adapt.build_cell_embeddings(cellspace, args, device, tag=dsname).to(device)
-            spaces[dsname] = (cellspace, embs)
-            logger.info('dataset=%s | cellspace=%s | embs=%s', dsname, cellspace, tuple(embs.shape))
+            region_pts[adapt.region_key(dsname)] += g['trajs']
+        spaces = {}
+        for rk, pts in sorted(region_pts.items()):
+            cellspace = adapt.build_cellspace(pts, args.cell_size)
+            embs = adapt.build_cell_embeddings(cellspace, args, device, tag=rk).to(device)
+            spaces[rk] = (cellspace, embs)
+            logger.info('region=%s | cellspace=%s | embs=%s', rk, cellspace, tuple(embs.shape))
         model = TrajCL().to(device); model.load_state_dict(ck['model'])
         head = PredictionHead(Config.seq_embedding_dim).to(device); head.load_state_dict(ck['head'])
         logger.info('Loaded checkpoint %s', args.ckpt)
@@ -233,15 +239,20 @@ def main():
         if not train_units:
             raise FileNotFoundError('No frozen train units found (pass --train-dir, or --ckpt for eval-only).')
 
-        # ----- Per-dataset Mercator trajs + CellSpace + node2vec cell embeddings (Option A) -----
+        # ----- Per-REGION Mercator trajs + CellSpace + node2vec cell embeddings -----
+        # Key on region (split suffix stripped) so a city's _train/_test share ONE cellspace+node2vec:
+        # halves node2vec runs and ensures pretrain & eval use the SAME embedding space
         train_groups = adapt.load_mercator_by_dataset(train_units, task='prediction')
-        spaces = {}                                       # dataset -> (cellspace, embs); grid spans train+test extent
-        for dsname in sorted(set(train_groups) | set(test_groups)):
-            pts = train_groups.get(dsname, {}).get('trajs', []) + test_groups.get(dsname, {}).get('trajs', [])
+        region_pts = defaultdict(list) # region -> all (train+test) Mercator trajs
+        for groups in (train_groups, test_groups):
+            for dsname, g in groups.items():
+                region_pts[adapt.region_key(dsname)] += g['trajs']
+        spaces = {}
+        for rk, pts in sorted(region_pts.items()):
             cellspace = adapt.build_cellspace(pts, args.cell_size)
-            embs = adapt.build_cell_embeddings(cellspace, args, device, tag=dsname).to(device)
-            spaces[dsname] = (cellspace, embs)
-            logger.info('dataset=%s | cellspace=%s | embs=%s', dsname, cellspace, tuple(embs.shape))
+            embs = adapt.build_cell_embeddings(cellspace, args, device, tag=rk).to(device)
+            spaces[rk] = (cellspace, embs)
+            logger.info('region=%s | cellspace=%s | embs=%s', rk, cellspace, tuple(embs.shape))
 
         # ----- Model (reused) + pretrain (reused MoCo objective) -----
         model = TrajCL().to(device)

@@ -25,6 +25,12 @@ sys.path.insert(0, str(_HERE.parents[2]))
 from bench_dataset import BenchmarkDataset
 from utils.cellspace import CellSpace
 
+_SPLIT_RE = re.compile(r'_(train|test|val|valid|dev)$', re.IGNORECASE)
+
+def region_key(dataset_name):
+    """Strip a trailing split suffix so e.g. 'brussels_enriched_train'/'_test' share one cellspace+node2vec."""
+    return _SPLIT_RE.sub('', dataset_name)
+
 def lonlat2meters(lon, lat):
     semimajoraxis = 6378137.0
     east = lon * 0.017453292519943295
@@ -92,6 +98,9 @@ def build_cell_embeddings(cellspace, cfg, device, tag='frozen') -> torch.Tensor:
     Config.node2vec_epochs = int(getattr(cfg, 'node2vec_epochs', 20)) # [perf-config]
     Config.node2vec_batch_size = int(getattr(cfg, 'node2vec_batch', 256)) # [perf-config]
     Config.node2vec_workers = int(getattr(cfg, 'node2vec_workers', 8)) # [perf-config]
+    Config.node2vec_walks_per_node = int(getattr(cfg, 'node2vec_walks', 10)) # [perf-config]
+    Config.node2vec_num_neg = int(getattr(cfg, 'node2vec_num_neg', 10)) # [perf-config]
+    Config.node2vec_walk_length = int(getattr(cfg, 'node2vec_walk_length', 50)) # [perf-config]
     Config.checkpoint_dir = str(ckpt_dir)
     Config.dataset_prefix = safe
     Config.dataset_embs_file = str(ckpt_dir / f'{safe}_embs.pkl')

@@ -18,9 +18,15 @@ def train_node2vec(edge_index):
     # The repo default batch_size=32 is overhead-bound on large cell grids; bigger batches use the GPU
     bs = getattr(Config, 'node2vec_batch_size', 32)
     nw = getattr(Config, 'node2vec_workers', 4)
+    # [perf-config] walk hyperparams: cost/epoch ~ walks_per_node*walk_length*(1+num_negative_samples).
+    # Defaults reproduce the repo; lowering num_negative_samples/walks_per_node is the real speed lever.
+    wl = getattr(Config, 'node2vec_walk_length', 50)
+    cs = getattr(Config, 'node2vec_context_size', 10)
+    wpn = getattr(Config, 'node2vec_walks_per_node', 10)
+    nneg = getattr(Config, 'node2vec_num_neg', 10)
     model = Node2Vec(edge_index, embedding_dim=Config.cell_embedding_dim,
-                    walk_length=50, context_size=10, walks_per_node=10,
-                    num_negative_samples=10, p=1, q=1, sparse=True).to(Config.device)
+                    walk_length=wl, context_size=cs, walks_per_node=wpn,
+                    num_negative_samples=nneg, p=1, q=1, sparse=True).to(Config.device)
     loader = model.loader(batch_size=bs, shuffle=True, num_workers=nw)
     optimizer = torch.optim.SparseAdam(list(model.parameters()), lr=0.001)
     checkpoint_file = Config.checkpoint_dir + '/' + Config.dataset_prefix + '_node2vec_cell' + str(int(Config.cell_size)) + '_best.pt'
