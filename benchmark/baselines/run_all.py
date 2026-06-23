@@ -71,6 +71,11 @@ def main():
     ap.add_argument('--ckpt-dir', default=None) # train mode: --save-ckpt <dir>/<name>.pt ; eval-only: --ckpt
     ap.add_argument('--eval-only', action='store_true') # skip training, load checkpoints (region/domain transfer)
     ap.add_argument('--eval-domains', default=None) # override per-baseline domain at eval (domain transfer)
+    # SSL-baseline epoch passthrough (t2vec/trajcl ignore --epochs; these forward to their own knobs)
+    ap.add_argument('--pretrain-epochs', type=int, default=None)
+    ap.add_argument('--probe-epochs', type=int, default=None)
+    ap.add_argument('--node2vec-epochs', type=int, default=None) # trajcl only
+    ap.add_argument('--node2vec-batch', type=int, default=None) # trajcl only
     ap.add_argument('--out', default='baseline_results.json')
     args = ap.parse_args()
 
@@ -108,6 +113,16 @@ def main():
             cmd += ['--device', args.device]
         if not args.eval_only and e['epochs_flag'] and args.epochs is not None:
             cmd += [e['epochs_flag'], str(args.epochs)]
+        if not args.eval_only and name in ('t2vec', 'trajcl'):    # SSL baselines: own epoch knobs
+            if args.pretrain_epochs is not None:
+                cmd += ['--pretrain-epochs', str(args.pretrain_epochs)]
+            if args.probe_epochs is not None:
+                cmd += ['--probe-epochs', str(args.probe_epochs)]
+            if name == 'trajcl':
+                if args.node2vec_epochs is not None:
+                    cmd += ['--node2vec-epochs', str(args.node2vec_epochs)]
+                if args.node2vec_batch is not None:
+                    cmd += ['--node2vec-batch', str(args.node2vec_batch)]
         print(f">>> [{quad}] {name}: {' '.join(cmd)}", flush=True)
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, bufsize=1)

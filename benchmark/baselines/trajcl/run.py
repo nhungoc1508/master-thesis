@@ -184,6 +184,9 @@ def main():
     ap.add_argument('--heads', type=int, default=4)
     ap.add_argument('--layers', type=int, default=2)
     ap.add_argument('--moco-nqueue', type=int, default=256)
+    ap.add_argument('--node2vec-epochs', type=int, default=20) # node2vec cell-embedding pretraining
+    ap.add_argument('--node2vec-batch', type=int, default=2048) # repo default 32 is overhead-bound on big grids
+    ap.add_argument('--node2vec-workers', type=int, default=8)
     ap.add_argument('--pretrain-epochs', type=int, default=15)
     ap.add_argument('--probe-epochs', type=int, default=15)
     ap.add_argument('--batch', type=int, default=64)

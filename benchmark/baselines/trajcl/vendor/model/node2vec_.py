@@ -14,10 +14,14 @@ def train_node2vec(edge_index):
     # edge_index: tensor [2, n]
     logging.info("[node2vec] start.")
 
-    model = Node2Vec(edge_index, embedding_dim=Config.cell_embedding_dim, 
+    # [perf-config] batch_size/num_workers/epochs read from Config (defaults reproduce repo behavior)
+    # The repo default batch_size=32 is overhead-bound on large cell grids; bigger batches use the GPU
+    bs = getattr(Config, 'node2vec_batch_size', 32)
+    nw = getattr(Config, 'node2vec_workers', 4)
+    model = Node2Vec(edge_index, embedding_dim=Config.cell_embedding_dim,
                     walk_length=50, context_size=10, walks_per_node=10,
                     num_negative_samples=10, p=1, q=1, sparse=True).to(Config.device)
-    loader = model.loader(batch_size=32, shuffle=True, num_workers=4)
+    loader = model.loader(batch_size=bs, shuffle=True, num_workers=nw)
     optimizer = torch.optim.SparseAdam(list(model.parameters()), lr=0.001)
     checkpoint_file = Config.checkpoint_dir + '/' + Config.dataset_prefix + '_node2vec_cell' + str(int(Config.cell_size)) + '_best.pt'
     embs_file = Config.dataset_embs_file
@@ -58,7 +62,7 @@ def train_node2vec(edge_index):
         return
 
 
-    epoch_total = 20
+    epoch_total = getattr(Config, 'node2vec_epochs', 20)   # [perf-config]
     epoch_train_loss_best = 10000000.0
     epoch_best = 0
     epoch_patience = 10
