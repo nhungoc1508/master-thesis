@@ -10,7 +10,9 @@ Process:
 from __future__ import annotations
 
 import pickle
+import re
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +51,16 @@ def load_mercator_trajs(units, task):
         items.append(item)
     return trajs, items
 
+def load_mercator_by_dataset(units, task):
+    ds = BenchmarkDataset(units, task=task, with_sem=False)
+    groups = defaultdict(lambda: {'trajs': [], 'items': []})
+    for i in range(len(ds)):
+        item = ds[i]
+        g = groups[item['dataset']]
+        g['trajs'].append(item_to_mercator(item))
+        g['items'].append(item)
+    return dict(groups)
+
 def build_cellspace(merc_trajs, cell_size, buffer=500.0) -> CellSpace:
     """CellSpace over the dataset's Mercator extent (+ buffer)"""
     allpts = np.concatenate(merc_trajs, axis=0)
@@ -63,18 +75,23 @@ def build_edge_index(cellspace: CellSpace) -> torch.Tensor:
     e = np.concatenate([e, e[::-1]], axis=1)
     return torch.from_numpy(e)
 
-def build_cell_embeddings(cellspace, cfg, device) -> torch.Tensor:
-    """Run TrajCL's train_node2vec on the cell graph, return embs tensor (num_cells, cell_embedding_dim)"""
+def build_cell_embeddings(cellspace, cfg, device, tag='frozen') -> torch.Tensor:
+    """Run TrajCL's train_node2vec on the cell graph, return embs tensor (num_cells, cell_embedding_dim).
+
+    node2vec embeddings depend only on the cell-adjacency grid (pure geometry), not on which cells
+    are visited -> safe to build the grid over train+test extent with no train/test leakage.
+    """
     from config import Config
     from model.node2vec_ import train_node2vec
+    safe = re.sub(r'\W+', '_', str(tag))            # dataset name -> filesystem-safe checkpoint tag
     ckpt_dir = _HERE.parent / '_node2vec_tmp'
     ckpt_dir.mkdir(exist_ok=True)
     Config.device = device
     Config.cell_size = float(cfg.cell_size)
     Config.cell_embedding_dim = int(cfg.emb_dim)
     Config.checkpoint_dir = str(ckpt_dir)
-    Config.dataset_prefix = 'frozen'
-    Config.dataset_embs_file = str(ckpt_dir / 'frozen_embs.pkl')
+    Config.dataset_prefix = safe
+    Config.dataset_embs_file = str(ckpt_dir / f'{safe}_embs.pkl')
     edge_index = build_edge_index(cellspace).to(device)
     train_node2vec(edge_index)
     with open(Config.dataset_embs_file, 'rb') as fh:

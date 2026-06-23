@@ -52,7 +52,7 @@ class PredictionHead(nn.Module):
         )
 
     def forward(self, emb, tau):
-        return self.net(torch.cat([emb, tau]), dim=-1)
+        return self.net(torch.cat([emb, tau], dim=-1))
     
 def set_config(args, device):
     """Populate TrajCL's global config for own data"""
@@ -68,20 +68,27 @@ def set_config(args, device):
     Config.trajcl_local_mask_sidelen = Config.cell_size * 11
     Config.trajcl_aug1, Config.trajcl_aug2 = 'mask', 'subset'
 
-def pretrain(model, merc_trajs, cellspace, embs, cfg, device):
+def pretrain(model, groups, spaces, cfg, device):
+    """Shared MoCo encoder over pooled trajectories, each batch is built within one dataset so it
+    uses that dataset's own cellspace + node2vec embeddings"""
     from model.trajcl import collate_and_augment
     from utils.traj import get_aug_fn
     aug1, aug2 = get_aug_fn(Config.trajcl_aug1), get_aug_fn(Config.trajcl_aug2)
     opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=1e-4)
-    n = len(merc_trajs); idx = np.arange(n)
     model.train()
     for ep in range(1, cfg.pretrain_epochs + 1):
-        np.random.shuffle(idx); tot = nb = 0.0
-        for b in range(0, n, cfg.batch):
-            sel = idx[b:b + cfg.batch]
-            if len(sel) < 2:
-                continue
-            trajs = [merc_trajs[i] for i in sel]
+        batches = []
+        for dsname, g in groups.items():
+            trajs = g['trajs']; n = len(trajs); idx = np.random.permutation(n)
+            for b in range(0, n, cfg.batch):
+                sel = idx[b:b + cfg.batch]
+                if len(sel) < 2:
+                    continue
+                batches.append((dsname, [trajs[i] for i in sel]))
+        np.random.shuffle(batches)
+        tot = nb = 0.0
+        for dsname, trajs in batches:
+            cellspace, embs = spaces[dsname]
             batch = collate_and_augment(trajs, cellspace, embs, aug1, aug2)
             logits, targets = model(*batch)
             loss = model.loss(logits, targets)
@@ -112,15 +119,23 @@ def _embed(model, cellspace, embs, prefixes, device, no_grad):
         z = model.interpret(emb_cell, emb_p, lens)
     return z
 
-def train_probe(model, head, recs, cellspace, embs, cfg, device, finetune):
+def train_probe(model, head, recs, spaces, cfg, device, finetune):
     params = list(head.parameters()) + (list(model.parameters()) if finetune else [])
     opt = torch.optim.Adam(params, lr=cfg.probe_lr)
     model.train(finetune); head.train()
-    n = len(recs)
+    by_ds = defaultdict(list)
+    for r in recs:
+        by_ds[r['item']['dataset']].append(r)
     for ep in range(1, cfg.probe_epochs + 1):
-        order = np.random.permutation(n); tot = nb = 0.0
-        for b in range(0, n, cfg.batch):
-            batch = [recs[i] for i in order[b:b + cfg.batch]]
+        batches = []
+        for dsname, rs in by_ds.items():
+            order = np.random.permutation(len(rs))
+            for b in range(0, len(rs), cfg.batch):
+                batches.append((dsname, [rs[i] for i in order[b:b + cfg.batch]]))
+        np.random.shuffle(batches)
+        tot = nb = 0.0
+        for dsname, batch in batches:
+            cellspace, embs = spaces[dsname]
             z = _embed(model, cellspace, embs, [r['prefix'] for r in batch], device, no_grad=not finetune)
             loss = 0.0
             for j, r in enumerate(batch):
@@ -134,19 +149,24 @@ def train_probe(model, head, recs, cellspace, embs, cfg, device, finetune):
                     ' (ft)' if finetune else '', ep, cfg.probe_epochs, tot / max(nb, 1))
 
 @torch.no_grad()
-def evaluate(model, head, recs, cellspace, embs, device):
+def evaluate(model, head, recs, spaces, device):
     model.eval(); head.eval()
     overall, by_dom, by_ds = [], defaultdict(list), defaultdict(list)
-    z = _embed(model, cellspace, embs, [r['prefix'] for r in recs], device, no_grad=True)
-    for j, r in enumerate(recs):
-        it = r['item']; tlen = r['tlen']; M = r['target'].shape[0]
-        pred_m = head(z[j:j+1].expand(M, -1), r['tau'].to(device)).cpu().numpy()
-        pred_full = np.zeros((tlen, 2), np.float32); pred_full[r['masked']] = pred_m
-        target = it['target_coords'][:tlen].numpy()
-        err = metrics.recovery_error_m(pred_full, target, r['masked'], it['denorm'])
-        overall.append(err)
-        by_dom[_DOMAIN[int(it['domain_id'])]].append(err)
-        by_ds[it['dataset']].append(err)
+    groups = defaultdict(list)
+    for r in recs:
+        groups[r['item']['dataset']].append(r)
+    for dsname, rs in groups.items():
+        cellspace, embs = spaces[dsname]
+        z = _embed(model, cellspace, embs, [r['prefix'] for r in rs], device, no_grad=True)
+        for j, r in enumerate(rs):
+            it = r['item']; tlen = r['tlen']; M = r['target'].shape[0]
+            pred_m = head(z[j:j+1].expand(M, -1), r['tau'].to(device)).cpu().numpy()
+            pred_full = np.zeros((tlen, 2), np.float32); pred_full[r['masked']] = pred_m
+            target = it['target_coords'][:tlen].numpy()
+            err = metrics.recovery_error_m(pred_full, target, r['masked'], it['denorm'])
+            overall.append(err)
+            by_dom[_DOMAIN[int(it['domain_id'])]].append(err)
+            by_ds[it['dataset']].append(err)
     return {'overall': metrics.aggregate(overall),
             'by_domain': {k: metrics.aggregate(v) for k, v in sorted(by_dom.items())},
             'by_dataset': {k: metrics.aggregate(v) for k, v in sorted(by_ds.items())}}
@@ -181,12 +201,16 @@ def main():
     if not train_units or not test_units:
         raise FileNotFoundError('No frozen units found (check dirs/filters).')
 
-    # ----- Preprocessing: Mercator trajs + CellSpace + node2vec cell embeddings -----
-    merc_trajs, _ = adapt.load_mercator_trajs(train_units, task='prediction')
-    cellspace = adapt.build_cellspace(merc_trajs, args.cell_size)
-    logger.info('cellspace: %s', cellspace)
-    embs = adapt.build_cell_embeddings(cellspace, args, device).to(device)
-    logger.info('cell embeddings: %s', tuple(embs.shape))
+    # ----- Per-dataset Mercator trajs + CellSpace + node2vec cell embeddings (Option A) -----
+    train_groups = adapt.load_mercator_by_dataset(train_units, task='prediction')
+    test_groups = adapt.load_mercator_by_dataset(test_units, task='prediction')
+    spaces = {}                                       # dataset -> (cellspace, embs); grid spans train+test extent
+    for dsname in sorted(set(train_groups) | set(test_groups)):
+        pts = train_groups.get(dsname, {}).get('trajs', []) + test_groups.get(dsname, {}).get('trajs', [])
+        cellspace = adapt.build_cellspace(pts, args.cell_size)
+        embs = adapt.build_cell_embeddings(cellspace, args, device, tag=dsname).to(device)
+        spaces[dsname] = (cellspace, embs)
+        logger.info('dataset=%s | cellspace=%s | embs=%s', dsname, cellspace, tuple(embs.shape))
 
     # ----- Model (reused) + pretrain (reused MoCo objective) -----
     from model.trajcl import TrajCL
@@ -194,16 +218,16 @@ def main():
     cfg = type('C', (), dict(pretrain_epochs=args.pretrain_epochs, probe_epochs=args.probe_epochs,
                              batch=args.batch, lr=args.lr, probe_lr=args.probe_lr))
     logger.info('--- Pre-training (TrajCL MoCo, reused) ---')
-    pretrain(model, merc_trajs, cellspace, embs, cfg, device)
+    pretrain(model, train_groups, spaces, cfg, device)
 
     # ----- Prediction probe + eval -----
-    _, train_items = adapt.load_mercator_trajs(train_units, task='prediction')
-    _, test_items = adapt.load_mercator_trajs(test_units, task='prediction')
+    train_items = [it for g in train_groups.values() for it in g['items']]
+    test_items = [it for g in test_groups.values() for it in g['items']]
     head = PredictionHead(Config.seq_embedding_dim).to(device)
     logger.info('--- Prediction probe (%s) ---', args.mode)
-    train_probe(model, head, _prefix_records(train_items), cellspace, embs, cfg, device,
+    train_probe(model, head, _prefix_records(train_items), spaces, cfg, device,
                 finetune=(args.mode == 'finetune'))
-    res = evaluate(model, head, _prefix_records(test_items), cellspace, embs, device)
+    res = evaluate(model, head, _prefix_records(test_items), spaces, device)
     o = res['overall']
     print(f"\n=== TrajCL • prediction · {args.mode} ===")
     print(f"  OVERALL mae={o.get('mae_m', float('nan')):.1f}m median={o.get('median_m', float('nan')):.1f}m "

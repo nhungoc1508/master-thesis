@@ -65,12 +65,13 @@ def main():
     for e in MATRIX:
         quad, name = e['quad'], e['name']
         slot = results.setdefault(quad, {})
-        if args.include and name not in args.include:
-            continue
-        if name in (args.skip or []):
+        if args.include is not None:
+            if name not in args.include:          # --include given -> run ONLY these (skip default ignored)
+                continue
+        elif name in (args.skip or []):
             slot[name] = {'status': 'skipped'}
             continue
-        cmd = [PY, str(HERE / e['script'])]
+        cmd = [PY, '-u', str(HERE / e['script'])]   # -u so child stdout streams unbuffered
         if e['train']:
             cmd += ['--train-dir', args.train_dir]
         cmd += ['--test-dir', args.test_dir, '--domains', e['domain']] + e['extra']
@@ -79,12 +80,19 @@ def main():
         if e['epochs_flag'] and args.epochs is not None:
             cmd += [e['epochs_flag'], str(args.epochs)]
         print(f">>> [{quad}] {name}: {' '.join(cmd)}", flush=True)
-        p = subprocess.run(cmd, capture_output=True, text=True)
-        res = parse_stdout(p.stdout)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+        captured = []
+        for line in proc.stdout:                 # tee: stream live + keep text for parsing
+            print(line, end='', flush=True)
+            captured.append(line)
+        proc.wait()
+        out = ''.join(captured)
+        res = parse_stdout(out)
         if res is None:
-            slot[name] = {'status': 'FAILED', 'returncode': p.returncode,
-                          'stderr_tail': p.stderr[-800:]}
-            print(f"    FAILED (exit {p.returncode}) — see stderr_tail in JSON", flush=True)
+            slot[name] = {'status': 'FAILED', 'returncode': proc.returncode,
+                          'stderr_tail': out[-800:]}
+            print(f"    FAILED (exit {proc.returncode}) — see stderr_tail in JSON", flush=True)
         else:
             slot[name] = res
             o = res['overall']
