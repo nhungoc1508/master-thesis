@@ -437,19 +437,20 @@ def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
         scheduler.step()
         tr_sp, tr_tp, tr_kn = _group_per_dim(pd_sum / max(n_batches, 1))
         va_sp, va_tp, va_kn = _group_per_dim(val_pd_sum / max(n_val, 1))
-        logger.info('Stage 2: epoch %3d/%d | train=%.6f | val_rec=%.6f', epoch,
-                    cfg.stage2_epochs, total_loss / max(n_batches, 1), val_loss)
+        logger.info('Stage 2: epoch %3d/%d | train=%.6f | val_rec=%.6f | val_spatial=%.6f', epoch,
+                    cfg.stage2_epochs, total_loss / max(n_batches, 1), val_loss, va_sp)
         logger.info('\ttrain rec[spatial=%.6f temporal=%.6f kin=%.6f] | '
                     'val rec[spatial=%.6f temporal=%.6f kin=%.6f]',
                     tr_sp, tr_tp, tr_kn, va_sp, va_tp, va_kn)
 
-        if val_loss < best_val:
-            best_val = val_loss
+        # Select/early-stop on the SPATIAL val MSE
+        if va_sp < best_val:
+            best_val = va_sp
             patience_count = 0
             torch.save(
                 {'epoch': epoch, 'stage': 2, 'model': model.state_dict(),
                  'optimizer': optimizer.state_dict(), 'scheduler': scheduler.state_dict(),
-                 'val_rec': best_val, 'best_val': best_val, 'step': step,
+                 'val_spatial': best_val, 'val_rec': val_loss, 'best_val': best_val, 'step': step,
                  'rng': _rng_state(), 'cfg': dataclasses.asdict(cfg)},
                  checkpoint_dir / ckpt_name
             )
@@ -462,7 +463,7 @@ def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
                 logger.info('Early stopping at epoch %d', epoch)
                 break
 
-    logger.info('Stage 2 completed; best val recovery loss: %.8f', best_val)
+    logger.info('Stage 2 completed; best val spatial MSE: %.8f', best_val)
 
 # Original training
 

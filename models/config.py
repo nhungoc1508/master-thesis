@@ -16,6 +16,11 @@ class ModelConfig:
     no_sem_token: bool = True
     n_domains: int = 2
 
+    # Recovery loss per-group weights
+    loss_w_spatial: float = 5.0
+    loss_w_temporal: float = 1.0
+    loss_w_kin: float = 0.25
+
     # Sparse Cross-Domain Mixture of Experts replacing per-block FFN
     n_experts: int = 8          # C: total number of expert networks
     moe_top_k: int = 4          # K: active experts per token

@@ -214,11 +214,14 @@ class SparseCrossDomainMoE(nn.Module):
 
 class STPEMultiheadAttention(nn.Module):
     """
-    Multi-head attention with spatio-temporal rotary positional encoding applied
-    to rotate W_Q and W_K
+    Multi-head attention with SEQUENCE-INDEX rotary positional encoding (RoPE).
+
+    Position = token index along the trajectory, which is known for every point including
+    masked ones, so it never leaks the target coordinate and every masked point keeps a
+    distinct positional anchor
     """
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, max_len: int = 1024):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_model = d_model
@@ -232,13 +235,19 @@ class STPEMultiheadAttention(nn.Module):
         self.W_o = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
 
-        # Learnable spatial frequency projection (shared across heads)
-        self.W_phi = nn.Parameter(torch.randn(n_freqs, 2) * 0.01)
+        # Standard RoPE inverse frequencies over the head dimension (non-persistent buffer)
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(0, self.d_head, 2).float() / self.d_head))
+        self.register_buffer('inv_freq', inv_freq, persistent=False) # (n_freqs,)
+
+    def _rope_cos_sin(self, L: int, device, dtype) -> tuple[torch.Tensor, torch.Tensor]:
+        pos = torch.arange(L, device=device, dtype=torch.float32) # (L,)
+        ang = torch.outer(pos, self.inv_freq.to(device))  # (L, n_freqs)
+        ang = torch.repeat_interleave(ang, 2, dim=-1) # (L, d_h): pair (2k,2k+1) share freq
+        return (ang.cos().to(dtype)[None, None], ang.sin().to(dtype)[None, None]) # (1,1,L,d_h)
 
     def forward(
         self,
         x: torch.Tensor,
-        coords: torch.Tensor,
         key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, L, _ = x.shape
@@ -251,7 +260,9 @@ class STPEMultiheadAttention(nn.Module):
         k = _split(self.W_k(x))
         v = _split(self.W_v(x))
 
-        q, k = apply_spatial_rope(q, k, coords, self.W_phi)
+        cos, sin = self._rope_cos_sin(L, x.device, q.dtype)
+        q = q * cos + _rotate_half(q) * sin
+        k = k * cos + _rotate_half(k) * sin
 
         scale = math.sqrt(d_h)
         attn = torch.matmul(q, k.transpose(-2, -1)) / scale  # (B, H, L, L)
@@ -269,81 +280,31 @@ class STPEMultiheadAttention(nn.Module):
     
 class DomainAwareSTPELayer(nn.Module):
     """
-    Transformer layer with spatio-temporal rotary positional encoding (STPE)
-    with per-domain spatial frequency offset + mixture of experts
+    Transformer layer = sequence-index RoPE attention + sparse cross-domain MoE
 
-    \phi_i = W_phi \cdot [x, y]^T + W_phi_dom[domain]
+    Positional encoding is now on the token index, not coordinates, so there is no
+    per-domain coordinate-frequency bias anymore
+    Domain conditioning is retained via the domain token embedding E_dom added in
+    the input embedding, and via the MoE
     """
 
     def __init__(self, d_model: int, n_heads: int, n_domains: int = 2,
                  n_experts: int = 8, top_k: int = 4, dropout: float = 0.1):
         super().__init__()
-        d_h = d_model // n_heads
-        n_freqs = d_h // 2
         self.n_heads = n_heads
-        self.d_head = d_h
+        self.d_head = d_model // n_heads
 
         self.attn = STPEMultiheadAttention(d_model, n_heads, dropout)
-
-        # Per-domain spatial frequency bias
-        self.W_phi_dom = nn.Embedding(n_domains, n_freqs)
-        nn.init.zeros_(self.W_phi_dom.weight)
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         # MoE replaces traditional FFN
         self.moe = SparseCrossDomainMoE(d_model, hidden_dim=2*d_model, n_experts=n_experts,
                                         top_k=top_k, dropout=dropout)
-        # self.ffn = nn.Sequential(
-        #     nn.Linear(d_model, ffn_dim),
-        #     nn.GELU(),
-        #     nn.Dropout(dropout),
-        #     nn.Linear(ffn_dim, d_model),
-        #     nn.Dropout(dropout)
-        # )
-    
-    def forward(self, x: torch.Tensor, coords: torch.Tensor, domain_ids: torch.Tensor,
+
+    def forward(self, x: torch.Tensor,
                 pad_mask: torch.Tensor | None = None) -> torch.Tensor:
-        B, L, d = x.shape
-        H, d_h = self.n_heads, self.d_head
-        n_freqs = d_h // 2
-
-        dom_offset = self.W_phi_dom(domain_ids)
-        dom_coords_bias = dom_offset.unsqueeze(1).expand(B, L, n_freqs)
-
-        # Manually apply attention with domain-aware rotation
-        x_norm = self.norm1(x)
-        q = self.attn.W_q(x_norm).view(B, L, H, d_h).transpose(1, 2)
-        k = self.attn.W_k(x_norm).view(B, L, H, d_h).transpose(1, 2)
-        v = self.attn.W_v(x_norm).view(B, L, H, d_h).transpose(1, 2)
-
-        k_idx = torch.arange(n_freqs, dtype=torch.float32, device=x.device)
-        theta = 10000.0 ** (-2 * k_idx / d_h)
-        
-        # Compute per-point spatial frequencies including domain offset
-        phi_base = coords @ self.attn.W_phi.T
-        phi = (phi_base + dom_coords_bias) * theta
-
-        phi_inter = torch.repeat_interleave(phi, 2, dim=-1).unsqueeze(1)
-        cos_phi = torch.cos(phi_inter)
-        sin_phi = torch.sin(phi_inter)
-
-        q_rot = q * cos_phi + _rotate_half(q) * sin_phi
-        k_rot = k * cos_phi + _rotate_half(k) * sin_phi
-
-        scale = math.sqrt(d_h)
-        attn_w = torch.matmul(q_rot, k_rot.transpose(-2, -1)) / scale
-        if pad_mask is not None:
-            attn_w = attn_w.masked_fill(pad_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
-        attn_w = F.softmax(attn_w, dim=-1)
-        attn_w = self.attn.dropout(attn_w)
-
-        out = torch.matmul(attn_w, v).transpose(1, 2).contiguous().view(B, L, d)
-        out = self.attn.W_o(out)
-        x = x + out
-
-        # x = x + self.ffn(self.norm2(x))
-        # Moe block
+        x = x + self.attn(self.norm1(x), key_padding_mask=pad_mask)
         valid_mask = (~pad_mask) if pad_mask is not None else None
         moe_out, lb_loss = self.moe(self.norm2(x), valid_mask=valid_mask)
         x = x + moe_out
@@ -435,9 +396,14 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
             # Masking scenario 3: pos_mask -> semantics need to be masked before cross attention
             self.no_sem = nn.Parameter(torch.zeros(cfg.sem_dim))
         
-        # RoPE: [MASK_COORD] token to replace coords when whole point is masked
-        self.mask_coords = nn.Parameter(torch.zeros(2))
-        
+        # Per-dimension recovery-loss weights [d_lat, d_lon, d_t, speed, heading, turn]
+        # Spatial is the eval metric (up-weighted); kinematics noisy (down-weighted)
+        w = torch.full((cfg.input_dim,), float(cfg.loss_w_kin))
+        w[0] = w[1] = float(cfg.loss_w_spatial)
+        if cfg.input_dim > 2:
+            w[2] = float(cfg.loss_w_temporal)
+        self.register_buffer('loss_dim_w', w)
+
         # Contrastive components
         self.W_traj_sem = nn.Linear(d, d, bias=False)
         self.log_tau = nn.Parameter(torch.tensor(cfg.tau_init).log())
@@ -496,12 +462,11 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
             return self.kin_unk.view(1, 1, 3).expand_as(kinematics)
         return kinematics
 
-    def _run_layers(self, z: torch.Tensor, coords: torch.Tensor, domain_ids: torch.Tensor,
-                    pad_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run all MoE layers, accumulating mean load-balance loss"""
+    def _run_layers(self, z: torch.Tensor, pad_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run all MoE layers, accumulating mean load-balance loss (RoPE is sequence-index)"""
         lb_total = z.new_tensor(0.0)
         for layer in self.layers:
-            z, lb = layer(z, coords, domain_ids, pad_mask=pad_mask)
+            z, lb = layer(z, pad_mask=pad_mask)
             lb_total = lb_total + lb
         lb_total = lb_total / max(len(self.layers), 1)
         return self.norm(z), lb_total
@@ -521,12 +486,7 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         B, L, _ = x_spatial.shape
         kin = self._apply_kin_unk(kinematics, kin_group_masked)
         e = self._embed(x_spatial, tau, kin, domain_ids)
-
-        # z = e
-        # for layer in self.layers:
-        #     z = layer(z, coords, domain_ids, pad_mask=pad_mask)
-        # z = self.norm(z)
-        z, _ = self._run_layers(e, coords, domain_ids, pad_mask)
+        z, _ = self._run_layers(e, pad_mask)
 
         if apply_g and self.g is not None:
             if e_sem is None and hasattr(self, 'no_sem'):
@@ -592,22 +552,11 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         # Content masking happens INSIDE _embed: at masked positions the spatial
         # half -> [MASK_SPATIAL] and kinematics -> 0, but the temporal embedding
         # Fourier(tau) is kept as the per-point localization anchor
+        # Spatial content at masked positions is replaced by [MASK_SPATIAL] inside _embed
+        # RoPE is sequence-index (in the attention layers), so coords are not used for
+        # positional encoding -> no spatial leakage and no need for a [MASK_COORD] token
         e = self._embed(x_spatial, tau, kin, domain_ids, pos_mask=pos_mask)
-
-        if pos_mask is not None:
-            # Mask coordinates for STRPE (prevent spatial leakage via the rotary
-            # angles). tau (kept in the embedding) is the anchor instead
-            mask_coords_tok = self.mask_coords.view(1, 1, 2).expand(B, L, 2)
-            coords_input = torch.where(pos_mask.unsqueeze(-1), mask_coords_tok, coords)
-        else:
-            # If not masked, coords remains visible
-            coords_input = coords
-
-        # z = e
-        # for layer in self.layers:
-        #     z = layer(z, coords_input, domain_ids, pad_mask=pad_mask)
-        # z = self.norm(z)
-        z, lb_loss = self._run_layers(e, coords_input, domain_ids, pad_mask)
+        z, lb_loss = self._run_layers(e, pad_mask)
 
         if self.g is not None:
             if e_sem_use is not None:
@@ -623,15 +572,19 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         if pos_mask is not None:
             real_masked = pos_mask & ~pad_mask
             if real_masked.any():
-                diff2 = (pred[real_masked] - target[real_masked]) ** 2
-                out['loss'] = diff2.mean()
-                # Per-dimension recovery MSE [d_lat, d_lon, d_t, speed, heading, turn]
-                # lets training surface spatial vs. temporal vs. kinematic error
-                # separately instead of hiding it in the 6-dim average
-                out['loss_per_dim'] = diff2.mean(dim=0).detach()
+                diff2 = (pred[real_masked] - target[real_masked]) ** 2 # (N, input_dim)
+                per_dim = diff2.mean(dim=0) # (input_dim,)
+                # Weighted recovery loss: spatial up-weighted (eval metric), kin down-weighted
+                w = self.loss_dim_w.to(per_dim.dtype)
+                out['loss'] = (per_dim * w).sum() / w.sum()
+                # Per-dimension recovery MSE [d_lat, d_lon, d_t, speed, heading, turn] for logging,
+                # plus the unweighted spatial MSE used for checkpoint selection.
+                out['loss_per_dim'] = per_dim.detach()
+                out['loss_spatial'] = per_dim[:2].mean().detach()
             else:
                 out['loss'] = torch.tensor(0.0, device=x_spatial.device)
                 out['loss_per_dim'] = torch.zeros(pred.shape[-1], device=x_spatial.device)
+                out['loss_spatial'] = torch.tensor(0.0, device=x_spatial.device)
 
         # loss_recovery = out['loss']
         # loss_sem_pred = torch.tensor(0.0, device=x_spatial.device)
@@ -741,40 +694,3 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
     return torch.stack([-x2, x1], dim=-1).flatten(-2)
-
-def apply_spatial_rope(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    coords: torch.Tensor,
-    W_phi: nn.Parameter,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Apply Spatial Rotary Positional Encoding to Q and K.
-
-    Args:
-        q, k : (B, H, L, d_h) — query and key from projection
-        coords: (B, L, 2) — [Δlat_norm, Δlon_norm] per point
-        W_phi : (d_h//2, 2) — learnable spatial frequency projection
-
-    Returns rotated (q, k) of same shape.
-    """
-    d_h = q.size(-1)
-    n_freqs = d_h // 2
-
-    # Compute per-point spatial frequencies: (B, L, n_freqs)
-    phi = coords @ W_phi.T   # (B, L, 2) × (2, n_freqs) → (B, L, n_freqs)
-
-    # Base frequencies θ_k = 10000^{-2k / d_h}  for k = 0..n_freqs-1
-    k_idx = torch.arange(n_freqs, dtype=torch.float32, device=q.device)
-    theta = 10000.0 ** (-2 * k_idx / d_h)          # (n_freqs,)
-    phi = phi * theta                                # (B, L, n_freqs)
-
-    # Interleave: (B, L, d_h) where pair 2k, 2k+1 share frequency phi_k
-    phi_interleaved = torch.repeat_interleave(phi, 2, dim=-1)  # (B, L, d_h)
-
-    cos_phi = torch.cos(phi_interleaved).unsqueeze(1)  # (B, 1, L, d_h)
-    sin_phi = torch.sin(phi_interleaved).unsqueeze(1)  # (B, 1, L, d_h)
-
-    q_rot = q * cos_phi + _rotate_half(q) * sin_phi
-    k_rot = k * cos_phi + _rotate_half(k) * sin_phi
-    return q_rot, k_rot
