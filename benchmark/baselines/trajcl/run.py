@@ -171,6 +171,23 @@ def evaluate(model, head, recs, spaces, device):
             'by_domain': {k: metrics.aggregate(v) for k, v in sorted(by_dom.items())},
             'by_dataset': {k: metrics.aggregate(v) for k, v in sorted(by_ds.items())}}
 
+def _build_region_spaces(region_pts, args, device):
+    """region -> (cellspace, embs). Logs size BEFORE node2vec and bails past --max-cells so a
+    giant lattice (excluded/outlier dataset) fails loud instead of OOM-killing the process."""
+    spaces = {}
+    for rk, pts in sorted(region_pts.items()):
+        cellspace = adapt.build_cellspace(pts, args.cell_size, extent_pct=args.extent_pct)
+        n_cells = cellspace.x_size * cellspace.y_size
+        logger.info('region=%s | cellspace=%s | n_cells=%d', rk, cellspace, n_cells)
+        if n_cells > args.max_cells:
+            raise RuntimeError(
+                f"region '{rk}' grid has {n_cells:,} cells (> --max-cells {args.max_cells:,}); "
+                f"likely an excluded/outlier dataset or inflated extent — exclude it or raise --cell-size.")
+        embs = adapt.build_cell_embeddings(cellspace, args, device, tag=rk).to(device)
+        spaces[rk] = (cellspace, embs)
+        logger.info('  region=%s embs=%s', rk, tuple(embs.shape))
+    return spaces
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--train-dir')                  # not required in eval-only (--ckpt) mode
@@ -179,6 +196,8 @@ def main():
     ap.add_argument('--datasets', nargs='*', default=None)
     ap.add_argument('--mode', default='frozen', choices=['frozen', 'finetune'])
     ap.add_argument('--cell-size', type=float, default=100.0)
+    ap.add_argument('--max-cells', type=int, default=5_000_000)  # bail before a giant lattice OOM-kills node2vec
+    ap.add_argument('--extent-pct', type=float, default=0.5)  # clip cellspace to [pct,100-pct] percentiles (GPS-outlier robust); 0=raw min/max
     ap.add_argument('--emb-dim', type=int, default=128)
     ap.add_argument('--trans-hidden-dim', type=int, default=512)
     ap.add_argument('--heads', type=int, default=4)
@@ -222,12 +241,7 @@ def main():
         region_pts = defaultdict(list) # one grid per region (split suffix stripped)
         for dsname, g in test_groups.items():
             region_pts[adapt.region_key(dsname)] += g['trajs']
-        spaces = {}
-        for rk, pts in sorted(region_pts.items()):
-            cellspace = adapt.build_cellspace(pts, args.cell_size)
-            embs = adapt.build_cell_embeddings(cellspace, args, device, tag=rk).to(device)
-            spaces[rk] = (cellspace, embs)
-            logger.info('region=%s | cellspace=%s | embs=%s', rk, cellspace, tuple(embs.shape))
+        spaces = _build_region_spaces(region_pts, args, device)
         model = TrajCL().to(device); model.load_state_dict(ck['model'])
         head = PredictionHead(Config.seq_embedding_dim).to(device); head.load_state_dict(ck['head'])
         logger.info('Loaded checkpoint %s', args.ckpt)
@@ -247,12 +261,7 @@ def main():
         for groups in (train_groups, test_groups):
             for dsname, g in groups.items():
                 region_pts[adapt.region_key(dsname)] += g['trajs']
-        spaces = {}
-        for rk, pts in sorted(region_pts.items()):
-            cellspace = adapt.build_cellspace(pts, args.cell_size)
-            embs = adapt.build_cell_embeddings(cellspace, args, device, tag=rk).to(device)
-            spaces[rk] = (cellspace, embs)
-            logger.info('region=%s | cellspace=%s | embs=%s', rk, cellspace, tuple(embs.shape))
+        spaces = _build_region_spaces(region_pts, args, device)
 
         # ----- Model (reused) + pretrain (reused MoCo objective) -----
         model = TrajCL().to(device)

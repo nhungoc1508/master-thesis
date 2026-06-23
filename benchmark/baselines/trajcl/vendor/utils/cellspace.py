@@ -41,11 +41,12 @@ class CellSpace:
 
 
     def get_xyidx_by_point(self, x, y):
-        assert self.x_min <= x <= self.x_max \
-                and self.y_min <= y <= self.y_max
-        
+        # [robust-extent] clamp instead of assert: with a percentile-clipped cellspace, rare
+        # outlier points fall outside the box and should snap to the boundary cell, not crash.
         i_x = int(x - self.x_min) // self.x_unit
         i_y = int(y - self.y_min) // self.y_unit
+        i_x = min(max(i_x, 0), self.x_size - 1)
+        i_y = min(max(i_y, 0), self.y_size - 1)
         return (i_x, i_y)
 
 

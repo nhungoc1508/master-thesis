@@ -67,11 +67,21 @@ def load_mercator_by_dataset(units, task):
         g['items'].append(item)
     return dict(groups)
 
-def build_cellspace(merc_trajs, cell_size, buffer=500.0) -> CellSpace:
-    """CellSpace over the dataset's Mercator extent (+ buffer)"""
+def build_cellspace(merc_trajs, cell_size, buffer=500.0, extent_pct=0.0) -> CellSpace:
+    """CellSpace over the dataset's Mercator extent (+ buffer).
+
+    extent_pct>0 clips the box to the [extent_pct, 100-extent_pct] per-axis percentiles instead of
+    raw min/max, so GPS outliers (common in Porto/T-drive/Geolife) don't inflate the grid into a
+    mostly-empty multi-million-cell lattice. Out-of-box points clamp to the boundary cell.
+    """
     allpts = np.concatenate(merc_trajs, axis=0)
-    x_min, y_min = allpts.min(axis=0) - buffer
-    x_max, y_max = allpts.max(axis=0) + buffer
+    if extent_pct and extent_pct > 0:
+        lo = np.percentile(allpts, extent_pct, axis=0)
+        hi = np.percentile(allpts, 100.0 - extent_pct, axis=0)
+    else:
+        lo, hi = allpts.min(axis=0), allpts.max(axis=0)
+    x_min, y_min = lo - buffer
+    x_max, y_max = hi + buffer
     return CellSpace(cell_size, cell_size, float(x_min), float(y_min), float(x_max), float(y_max))
 
 def build_edge_index(cellspace: CellSpace) -> torch.Tensor:
