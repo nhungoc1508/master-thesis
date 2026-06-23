@@ -56,7 +56,7 @@ class PredictionHead(nn.Module):
         )
 
     def forward(self, emb, tau):
-        return self.net(torch.cat([emb, tau]), dim=-1)
+        return self.net(torch.cat([emb, tau], dim=-1))
     
 def _wrap_trg(tokens):
     """t2vec convention: src raw, trg = BOS + tokens + EOS."""
@@ -166,7 +166,7 @@ def evaluate(m0, head, recs, device):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--train-dir', required=True)
+    ap.add_argument('--train-dir')                  # not required in eval-only (--ckpt) mode
     ap.add_argument('--test-dir', required=True)
     ap.add_argument('--domains', nargs='*', default=None)
     ap.add_argument('--datasets', nargs='*', default=None)
@@ -184,47 +184,74 @@ def main():
     ap.add_argument('--lr', type=float, default=1e-3)
     ap.add_argument('--probe-lr', type=float, default=1e-3)
     ap.add_argument('--device', default=None)
+    ap.add_argument('--save-ckpt', default=None)    # after training, persist encoder+head+region here
+    ap.add_argument('--ckpt', default=None)         # load weights+region, skip training (eval-only)
     args = ap.parse_args()
 
     from bench_dataset import find_units
     device = torch.device(args.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
     logger.info('Device: %s | mode=%s', device, args.mode)
 
-    train_units = find_units(args.train_dir, domains=args.domains, datasets=args.datasets)
     test_units = find_units(args.test_dir, domains=args.domains, datasets=args.datasets)
-    if not train_units or not test_units:
-        raise FileNotFoundError('No frozen units found (check dirs/filters).')
+    if not test_units:
+        raise FileNotFoundError('No frozen test units found (check dir/filters).')
 
-    # ----- Build region + tokenized denoising pairs from train (data bridge) -----
-    abs_trajs, _ = bridge.load_abs_trajs(train_units, task='prediction')
-    region, n_out = bridge.build_region(abs_trajs, 'train', args.cellsize_m, args.minfreq, args.k)
-    logger.info('region: vocab_size=%d hotcells=%d out_of_region=%d',
-                region.vocab_size, len(region.hotcell), n_out)
-    rng = np.random.default_rng(0)
-    pairs = bridge.tokenize_pairs(region, abs_trajs, rng, drop_rate=0.3)
-    logger.info('denoising pairs: %d', len(pairs[0]))
+    if args.ckpt:
+        # ----- eval-only (region/domain transfer): reuse the SAVED region/vocab -----
+        # NOTE: the encoder embedding table is tied to the training region's cell vocabulary.
+        # Region transfer = held-out cities tokenize to UNK (weak but valid zero-shot).
+        # Domain transfer (e.g. urban->maritime) tokenizes to near-all-UNK -> not meaningful for t2vec.
+        ck = torch.load(args.ckpt, map_location=device, weights_only=False)
+        a = ck['arch']; region = ck['region']
+        m0 = EncoderDecoder(a['vocab_size'], a['embedding_size'], a['hidden_size'],
+                            a['num_layers'], a['dropout'], bidirectional=True).to(device)
+        m0.load_state_dict(ck['m0'])
+        head = PredictionHead(a['hidden_size']).to(device)
+        head.load_state_dict(ck['head'])
+        logger.info('Loaded checkpoint %s (vocab_size=%d)', args.ckpt, a['vocab_size'])
+        _, test_items = bridge.load_abs_trajs(test_units, task='prediction')
+        res = evaluate(m0, head, _prefix_tokens_and_targets(region, test_items), device)
+    else:
+        train_units = find_units(args.train_dir, domains=args.domains, datasets=args.datasets) if args.train_dir else None
+        if not train_units:
+            raise FileNotFoundError('No frozen train units found (pass --train-dir, or --ckpt for eval-only).')
 
-    # ----- Repo model + V/D, then repo pre-training -----
-    cfg = SimpleNamespace(vocab_size=region.vocab_size, generator_batch=256,
-                          pretrain_epochs=args.pretrain_epochs, probe_epochs=args.probe_epochs,
-                          batch=args.batch, lr=args.lr, probe_lr=args.probe_lr, max_grad_norm=5.0)
-    m0 = EncoderDecoder(region.vocab_size, args.embedding_size, args.hidden_size,
-                        args.num_layers, args.dropout, bidirectional=True).to(device)
-    m1 = nn.Sequential(nn.Linear(args.hidden_size, region.vocab_size), nn.LogSoftmax(dim=1)).to(device)
-    V, D = region.knearest_vocabs()
-    V = torch.LongTensor(V).to(device)
-    D = dist2weight(torch.FloatTensor(D)).to(device)
-    logger.info('--- Pre-training (t2vec denoising, repo objective) ---')
-    pretrain(m0, m1, pairs, V, D, cfg, device)
+        # ----- Build region + tokenized denoising pairs from train (data bridge) -----
+        abs_trajs, _ = bridge.load_abs_trajs(train_units, task='prediction')
+        region, n_out = bridge.build_region(abs_trajs, 'train', args.cellsize_m, args.minfreq, args.k)
+        logger.info('region: vocab_size=%d hotcells=%d out_of_region=%d',
+                    region.vocab_size, len(region.hotcell), n_out)
+        rng = np.random.default_rng(0)
+        pairs = bridge.tokenize_pairs(region, abs_trajs, rng, drop_rate=0.3)
+        logger.info('denoising pairs: %d', len(pairs[0]))
 
-    # ----- Prediction probe + eval -----
-    _, train_items = bridge.load_abs_trajs(train_units, task='prediction')
-    _, test_items = bridge.load_abs_trajs(test_units, task='prediction')
-    head = PredictionHead(args.hidden_size).to(device)
-    logger.info('--- Prediction probe (%s) ---', args.mode)
-    train_probe(m0, head, _prefix_tokens_and_targets(region, train_items), cfg, device,
-                finetune=(args.mode == 'finetune'))
-    res = evaluate(m0, head, _prefix_tokens_and_targets(region, test_items), device)
+        # ----- Repo model + V/D, then repo pre-training -----
+        cfg = SimpleNamespace(vocab_size=region.vocab_size, generator_batch=256,
+                              pretrain_epochs=args.pretrain_epochs, probe_epochs=args.probe_epochs,
+                              batch=args.batch, lr=args.lr, probe_lr=args.probe_lr, max_grad_norm=5.0)
+        m0 = EncoderDecoder(region.vocab_size, args.embedding_size, args.hidden_size,
+                            args.num_layers, args.dropout, bidirectional=True).to(device)
+        m1 = nn.Sequential(nn.Linear(args.hidden_size, region.vocab_size), nn.LogSoftmax(dim=1)).to(device)
+        V, D = region.knearest_vocabs()
+        V = torch.LongTensor(V).to(device)
+        D = dist2weight(torch.FloatTensor(D)).to(device)
+        logger.info('--- Pre-training (t2vec denoising, repo objective) ---')
+        pretrain(m0, m1, pairs, V, D, cfg, device)
+
+        # ----- Prediction probe + eval -----
+        _, train_items = bridge.load_abs_trajs(train_units, task='prediction')
+        _, test_items = bridge.load_abs_trajs(test_units, task='prediction')
+        head = PredictionHead(args.hidden_size).to(device)
+        logger.info('--- Prediction probe (%s) ---', args.mode)
+        train_probe(m0, head, _prefix_tokens_and_targets(region, train_items), cfg, device,
+                    finetune=(args.mode == 'finetune'))
+        if args.save_ckpt:
+            torch.save({'m0': m0.state_dict(), 'head': head.state_dict(), 'region': region,
+                        'arch': dict(vocab_size=region.vocab_size, embedding_size=args.embedding_size,
+                                     hidden_size=args.hidden_size, num_layers=args.num_layers,
+                                     dropout=args.dropout)}, args.save_ckpt)
+            logger.info('Saved checkpoint -> %s', args.save_ckpt)
+        res = evaluate(m0, head, _prefix_tokens_and_targets(region, test_items), device)
     o = res['overall']
     print(f"\n=== t2vec • prediction · {args.mode} ===")
     print(f"  OVERALL mae={o.get('mae_m', float('nan')):.1f}m median={o.get('median_m', float('nan')):.1f}m "

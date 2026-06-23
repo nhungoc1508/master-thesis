@@ -173,7 +173,7 @@ def evaluate(model, head, recs, spaces, device):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--train-dir', required=True)
+    ap.add_argument('--train-dir')                  # not required in eval-only (--ckpt) mode
     ap.add_argument('--test-dir', required=True)
     ap.add_argument('--domains', nargs='*', default=None)
     ap.add_argument('--datasets', nargs='*', default=None)
@@ -190,44 +190,75 @@ def main():
     ap.add_argument('--lr', type=float, default=1e-3)
     ap.add_argument('--probe-lr', type=float, default=1e-3)
     ap.add_argument('--device', default=None)
+    ap.add_argument('--save-ckpt', default=None)    # after training, persist encoder+head+arch here
+    ap.add_argument('--ckpt', default=None)         # load weights, skip training (eval-only)
     args = ap.parse_args()
 
     device = torch.device(args.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
-    set_config(args, device)
     logger.info('Device: %s | mode=%s', device, args.mode)
 
-    train_units = find_units(args.train_dir, domains=args.domains, datasets=args.datasets)
     test_units = find_units(args.test_dir, domains=args.domains, datasets=args.datasets)
-    if not train_units or not test_units:
-        raise FileNotFoundError('No frozen units found (check dirs/filters).')
-
-    # ----- Per-dataset Mercator trajs + CellSpace + node2vec cell embeddings (Option A) -----
-    train_groups = adapt.load_mercator_by_dataset(train_units, task='prediction')
+    if not test_units:
+        raise FileNotFoundError('No frozen test units found (check dir/filters).')
     test_groups = adapt.load_mercator_by_dataset(test_units, task='prediction')
-    spaces = {}                                       # dataset -> (cellspace, embs); grid spans train+test extent
-    for dsname in sorted(set(train_groups) | set(test_groups)):
-        pts = train_groups.get(dsname, {}).get('trajs', []) + test_groups.get(dsname, {}).get('trajs', [])
-        cellspace = adapt.build_cellspace(pts, args.cell_size)
-        embs = adapt.build_cell_embeddings(cellspace, args, device, tag=dsname).to(device)
-        spaces[dsname] = (cellspace, embs)
-        logger.info('dataset=%s | cellspace=%s | embs=%s', dsname, cellspace, tuple(embs.shape))
 
-    # ----- Model (reused) + pretrain (reused MoCo objective) -----
     from model.trajcl import TrajCL
-    model = TrajCL().to(device)
     cfg = type('C', (), dict(pretrain_epochs=args.pretrain_epochs, probe_epochs=args.probe_epochs,
                              batch=args.batch, lr=args.lr, probe_lr=args.probe_lr))
-    logger.info('--- Pre-training (TrajCL MoCo, reused) ---')
-    pretrain(model, train_groups, spaces, cfg, device)
 
-    # ----- Prediction probe + eval -----
-    train_items = [it for g in train_groups.values() for it in g['items']]
-    test_items = [it for g in test_groups.values() for it in g['items']]
-    head = PredictionHead(Config.seq_embedding_dim).to(device)
-    logger.info('--- Prediction probe (%s) ---', args.mode)
-    train_probe(model, head, _prefix_records(train_items), spaces, cfg, device,
-                finetune=(args.mode == 'finetune'))
-    res = evaluate(model, head, _prefix_records(test_items), spaces, device)
+    if args.ckpt:
+        # ----- eval-only (region/domain transfer): rebuild grids from TEST extent, reuse trained encoder -----
+        ck = torch.load(args.ckpt, map_location=device, weights_only=False)
+        a = ck['arch']
+        for k, v in a.items():
+            setattr(args, k, v)
+        set_config(args, device)
+        spaces = {}
+        for dsname, g in test_groups.items():
+            cellspace = adapt.build_cellspace(g['trajs'], args.cell_size)
+            embs = adapt.build_cell_embeddings(cellspace, args, device, tag=dsname).to(device)
+            spaces[dsname] = (cellspace, embs)
+            logger.info('dataset=%s | cellspace=%s | embs=%s', dsname, cellspace, tuple(embs.shape))
+        model = TrajCL().to(device); model.load_state_dict(ck['model'])
+        head = PredictionHead(Config.seq_embedding_dim).to(device); head.load_state_dict(ck['head'])
+        logger.info('Loaded checkpoint %s', args.ckpt)
+        test_items = [it for g in test_groups.values() for it in g['items']]
+        res = evaluate(model, head, _prefix_records(test_items), spaces, device)
+    else:
+        set_config(args, device)
+        train_units = find_units(args.train_dir, domains=args.domains, datasets=args.datasets) if args.train_dir else None
+        if not train_units:
+            raise FileNotFoundError('No frozen train units found (pass --train-dir, or --ckpt for eval-only).')
+
+        # ----- Per-dataset Mercator trajs + CellSpace + node2vec cell embeddings (Option A) -----
+        train_groups = adapt.load_mercator_by_dataset(train_units, task='prediction')
+        spaces = {}                                       # dataset -> (cellspace, embs); grid spans train+test extent
+        for dsname in sorted(set(train_groups) | set(test_groups)):
+            pts = train_groups.get(dsname, {}).get('trajs', []) + test_groups.get(dsname, {}).get('trajs', [])
+            cellspace = adapt.build_cellspace(pts, args.cell_size)
+            embs = adapt.build_cell_embeddings(cellspace, args, device, tag=dsname).to(device)
+            spaces[dsname] = (cellspace, embs)
+            logger.info('dataset=%s | cellspace=%s | embs=%s', dsname, cellspace, tuple(embs.shape))
+
+        # ----- Model (reused) + pretrain (reused MoCo objective) -----
+        model = TrajCL().to(device)
+        logger.info('--- Pre-training (TrajCL MoCo, reused) ---')
+        pretrain(model, train_groups, spaces, cfg, device)
+
+        # ----- Prediction probe + eval -----
+        train_items = [it for g in train_groups.values() for it in g['items']]
+        test_items = [it for g in test_groups.values() for it in g['items']]
+        head = PredictionHead(Config.seq_embedding_dim).to(device)
+        logger.info('--- Prediction probe (%s) ---', args.mode)
+        train_probe(model, head, _prefix_records(train_items), spaces, cfg, device,
+                    finetune=(args.mode == 'finetune'))
+        if args.save_ckpt:
+            torch.save({'model': model.state_dict(), 'head': head.state_dict(),
+                        'arch': dict(cell_size=args.cell_size, emb_dim=args.emb_dim,
+                                     trans_hidden_dim=args.trans_hidden_dim, heads=args.heads,
+                                     layers=args.layers, moco_nqueue=args.moco_nqueue)}, args.save_ckpt)
+            logger.info('Saved checkpoint -> %s', args.save_ckpt)
+        res = evaluate(model, head, _prefix_records(test_items), spaces, device)
     o = res['overall']
     print(f"\n=== TrajCL • prediction · {args.mode} ===")
     print(f"  OVERALL mae={o.get('mae_m', float('nan')):.1f}m median={o.get('median_m', float('nan')):.1f}m "

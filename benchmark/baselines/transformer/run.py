@@ -24,9 +24,11 @@ from torch.utils.data import DataLoader
 
 _HERE = Path(__file__).resolve()
 sys.path.insert(0, str(_HERE.parents[2]))
+sys.path.insert(0, str(_HERE.parents[1]))
 
 from bench_dataset import BenchmarkDataset, find_units, collate
 import metrics
+import common
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,7 +52,6 @@ class MaskedTransformer(nn.Module):
         self.coord_proj = nn.Linear(2, d_model)
         self.tau_proj = nn.Linear(4, d_model)
         self.kin_proj = nn.Linear(3, d_model)
-        self.domain_emb = nn.Embedding(2, d_model)
         self.mask_spatial = nn.Parameter(torch.randn(d_model) * 0.02)
         self.norm = nn.LayerNorm(d_model)
         layer = nn.TransformerEncoderLayer(d_model, n_heads, 4 * d_model, dropout,
@@ -65,7 +66,6 @@ class MaskedTransformer(nn.Module):
         e = e + self.tau_proj(tau)
         k = self.kin_proj(kin)
         e = e + torch.where(m, torch.zeros_like(k), k)
-        e = e + self.domain_emb(domain_id).unsqueeze(1)
         e = self.norm(e) + _sinusoid(e.shape[1], e.shape[2], e.device).unsqueeze(0)
         h = self.encoder(e, src_key_padding_mask=pad_mask)
         return self.head(h)
@@ -118,7 +118,7 @@ def evaluate(model, units, task, device, bs, nw):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--train-dir', required=True)
+    ap.add_argument('--train-dir')                  # not required in eval-only (--ckpt) mode
     ap.add_argument('--test-dir', required=True)
     ap.add_argument('--task', default='recovery', choices=['recovery', 'prediction'])
     ap.add_argument('--domains', nargs='*', default=None)
@@ -131,18 +131,33 @@ def main():
     ap.add_argument('--num-workers', type=int, default=2)
     ap.add_argument('--lr', type=float, default=1e-3)
     ap.add_argument('--device', default=None)
+    ap.add_argument('--save-ckpt', default=None)    # after training, persist weights here
+    ap.add_argument('--ckpt', default=None)         # load weights + skip training (eval-only)
     args = ap.parse_args()
 
     device = torch.device(args.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
-    train_units = find_units(args.train_dir, domains=args.domains, datasets=args.datasets)
     test_units = find_units(args.test_dir, domains=args.domains, datasets=args.datasets)
-    if not train_units or not test_units:
-        raise FileNotFoundError('No frozen units found (check dirs/filters).')
+    if not test_units:
+        raise FileNotFoundError('No frozen test units found (check dir/filters).')
     logger.info('Device: %s | task=%s', device, args.task)
 
-    model = MaskedTransformer(args.d_model, args.layers, args.heads).to(device)
-    logger.info('--- Training (supervised masked reconstruction) ---')
-    train(model, train_units, args.task, device, args.epochs, args.batch_size, args.num_workers, args.lr)
+    if args.ckpt: # ----- eval-only (region/domain transfer) -----
+        ck = common.load_ckpt(args.ckpt, device); a = ck['arch']
+        model = MaskedTransformer(a['d_model'], a['layers'], a['heads']).to(device)
+        model.load_state_dict(ck['model'])
+        logger.info('Loaded checkpoint %s (trained task=%s)', args.ckpt, a.get('task'))
+    else: # ----- train -----
+        train_units = find_units(args.train_dir, domains=args.domains, datasets=args.datasets) if args.train_dir else None
+        if not train_units:
+            raise FileNotFoundError('No frozen train units found (pass --train-dir, or --ckpt for eval-only).')
+        model = MaskedTransformer(args.d_model, args.layers, args.heads).to(device)
+        logger.info('--- Training (supervised masked reconstruction) ---')
+        train(model, train_units, args.task, device, args.epochs, args.batch_size, args.num_workers, args.lr)
+        if args.save_ckpt:
+            common.save_ckpt(args.save_ckpt, {'model': model.state_dict(),
+                                              'arch': dict(d_model=args.d_model, layers=args.layers,
+                                                           heads=args.heads, task=args.task)})
+            logger.info('Saved checkpoint -> %s', args.save_ckpt)
     res = evaluate(model, test_units, args.task, device, args.batch_size, args.num_workers)
     o = res['overall']
     print(f"\n=== Transformer • {args.task} ===")

@@ -24,7 +24,7 @@ class InputFeaturizer(nn.Module):
     Masked positions get a learned spatial mask token + zeroed kinematics; temporal features (tau) are kept
     """
 
-    def __init__(self, d_model, use_domain=True):
+    def __init__(self, d_model, use_domain=False):   # domain-agnostic by default -> clean domain transfer
         super().__init__()
         self.coord_proj = nn.Linear(2, d_model)
         self.tau_proj = nn.Linear(4, d_model)
@@ -95,3 +95,11 @@ def gather_masked(batch, device):
             tau_m[i, :n] = tau[i, idxs]; tgt_m[i, :n] = tgt[i, idxs]; valid[i, :n] = True
         idx_list.append(idxs)
     return (tau_m.to(device), tgt_m.to(device), valid.to(device), idx_list, Mmax)
+
+def save_ckpt(path, payload):
+    """Persist a trained baseline: {'model': state_dict, 'arch': {...}, ...}. Train once, eval many."""
+    p = Path(path); p.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, str(p))
+
+def load_ckpt(path, map_location='cpu'):
+    return torch.load(str(path), map_location=map_location, weights_only=False)

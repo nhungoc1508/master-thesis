@@ -57,7 +57,7 @@ def train(model, units, task, device, epochs, bs, nw, lr):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--train-dir', required=True)
+    ap.add_argument('--train-dir')                  # not required in eval-only (--ckpt) mode
     ap.add_argument('--test-dir', required=True)
     ap.add_argument('--task', default='recovery', choices=['recovery', 'prediction'])
     ap.add_argument('--domains', nargs='*', default=None)
@@ -69,18 +69,33 @@ def main():
     ap.add_argument('--num-workers', type=int, default=2)
     ap.add_argument('--lr', type=float, default=1e-3)
     ap.add_argument('--device', default=None)
+    ap.add_argument('--save-ckpt', default=None)    # after training, persist weights here
+    ap.add_argument('--ckpt', default=None)         # load weights + skip training (eval-only)
     args = ap.parse_args()
 
     device = torch.device(args.device or ('cuda' if torch.cuda.is_available() else 'cpu'))
-    train_units = common.find_units(args.train_dir, domains=args.domains, datasets=args.datasets)
     test_units = common.find_units(args.test_dir, domains=args.domains, datasets=args.datasets)
-    if not train_units or not test_units:
-        raise FileNotFoundError('No frozen units found (check dirs/filters).')
+    if not test_units:
+        raise FileNotFoundError('No frozen test units found (check dir/filters).')
     logger.info('Device: %s | task=%s', device, args.task)
 
-    model = BiLSTMImputer(args.d_model, args.layers).to(device)
-    logger.info('--- Training (BiLSTM masked imputation) ---')
-    train(model, train_units, args.task, device, args.epochs, args.batch_size, args.num_workers, args.lr)
+    if args.ckpt: # ----- eval-only (region/domain transfer) -----
+        ck = common.load_ckpt(args.ckpt, device); a = ck['arch']
+        model = BiLSTMImputer(a['d_model'], a['layers']).to(device)
+        model.load_state_dict(ck['model'])
+        logger.info('Loaded checkpoint %s (trained task=%s)', args.ckpt, a.get('task'))
+    else: # ----- train -----
+        train_units = common.find_units(args.train_dir, domains=args.domains, datasets=args.datasets) if args.train_dir else None
+        if not train_units:
+            raise FileNotFoundError('No frozen train units found (pass --train-dir, or --ckpt for eval-only).')
+        model = BiLSTMImputer(args.d_model, args.layers).to(device)
+        logger.info('--- Training (BiLSTM masked imputation) ---')
+        train(model, train_units, args.task, device, args.epochs, args.batch_size, args.num_workers, args.lr)
+        if args.save_ckpt:
+            common.save_ckpt(args.save_ckpt, {'model': model.state_dict(),
+                                              'arch': dict(d_model=args.d_model, layers=args.layers,
+                                                           task=args.task)})
+            logger.info('Saved checkpoint -> %s', args.save_ckpt)
 
     model.eval()
     def predict_batch(b):
