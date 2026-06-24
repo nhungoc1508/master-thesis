@@ -276,6 +276,7 @@ def main():
         train_probe(model, head, _prefix_records(train_items), spaces, cfg, device,
                     finetune=(args.mode == 'finetune'))
         if args.save_ckpt:
+            Path(args.save_ckpt).parent.mkdir(parents=True, exist_ok=True)
             torch.save({'model': model.state_dict(), 'head': head.state_dict(),
                         'arch': dict(cell_size=args.cell_size, emb_dim=args.emb_dim,
                                      trans_hidden_dim=args.trans_hidden_dim, heads=args.heads,

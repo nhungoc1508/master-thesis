@@ -87,6 +87,9 @@ def main():
     if not args.eval_only and not args.train_dir:
         ap.error('training mode requires --train-dir (or pass --eval-only for transfer eval)')
 
+    if args.ckpt_dir and not args.eval_only:
+        Path(args.ckpt_dir).mkdir(parents=True, exist_ok=True)
+
     results = {}
     for e in MATRIX:
         quad, name = e['quad'], e['name']
