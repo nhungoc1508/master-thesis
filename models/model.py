@@ -221,12 +221,14 @@ class STPEMultiheadAttention(nn.Module):
     distinct positional anchor
     """
 
-    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, max_len: int = 1024):
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1, max_len: int = 1024,
+                 use_rope: bool = True):
         super().__init__()
         assert d_model % n_heads == 0
         self.d_model = d_model
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
+        self.use_rope = use_rope
         n_freqs = self.d_head // 2
 
         self.W_q = nn.Linear(d_model, d_model, bias=False)
@@ -260,9 +262,10 @@ class STPEMultiheadAttention(nn.Module):
         k = _split(self.W_k(x))
         v = _split(self.W_v(x))
 
-        cos, sin = self._rope_cos_sin(L, x.device, q.dtype)
-        q = q * cos + _rotate_half(q) * sin
-        k = k * cos + _rotate_half(k) * sin
+        if self.use_rope: # sequence-index RoPE (ablation: 'sinusoidal' skips this)
+            cos, sin = self._rope_cos_sin(L, x.device, q.dtype)
+            q = q * cos + _rotate_half(q) * sin
+            k = k * cos + _rotate_half(k) * sin
 
         scale = math.sqrt(d_h)
         attn = torch.matmul(q, k.transpose(-2, -1)) / scale  # (B, H, L, L)
@@ -289,25 +292,36 @@ class DomainAwareSTPELayer(nn.Module):
     """
 
     def __init__(self, d_model: int, n_heads: int, n_domains: int = 2,
-                 n_experts: int = 8, top_k: int = 4, dropout: float = 0.1):
+                 n_experts: int = 8, top_k: int = 4, dropout: float = 0.1,
+                 use_moe: bool = True, use_rope: bool = True, ffn_dim: int = 512):
         super().__init__()
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
+        self.use_moe = use_moe
 
-        self.attn = STPEMultiheadAttention(d_model, n_heads, dropout)
+        self.attn = STPEMultiheadAttention(d_model, n_heads, dropout, use_rope=use_rope)
 
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-        # MoE replaces traditional FFN
-        self.moe = SparseCrossDomainMoE(d_model, hidden_dim=2*d_model, n_experts=n_experts,
-                                        top_k=top_k, dropout=dropout)
+        if use_moe:
+            # MoE replaces the traditional FFN
+            self.moe = SparseCrossDomainMoE(d_model, hidden_dim=2*d_model, n_experts=n_experts,
+                                            top_k=top_k, dropout=dropout)
+        else:
+            # Ablation: standard transformer FFN
+            self.ffn = nn.Sequential(
+                nn.Linear(d_model, ffn_dim), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(ffn_dim, d_model), nn.Dropout(dropout))
 
     def forward(self, x: torch.Tensor,
                 pad_mask: torch.Tensor | None = None) -> torch.Tensor:
         x = x + self.attn(self.norm1(x), key_padding_mask=pad_mask)
-        valid_mask = (~pad_mask) if pad_mask is not None else None
-        moe_out, lb_loss = self.moe(self.norm2(x), valid_mask=valid_mask)
-        x = x + moe_out
+        if self.use_moe:
+            valid_mask = (~pad_mask) if pad_mask is not None else None
+            block_out, lb_loss = self.moe(self.norm2(x), valid_mask=valid_mask)
+        else:
+            block_out, lb_loss = self.ffn(self.norm2(x)), x.new_tensor(0.0)
+        x = x + block_out
         return x, lb_loss
 
 # ========== Semantic cross-attention ==========
@@ -379,10 +393,17 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
             DomainAwareSTPELayer(
                 d, cfg.n_heads, cfg.n_domains,
                 n_experts=cfg.n_experts, top_k=cfg.moe_top_k,
-                dropout=cfg.dropout)
+                dropout=cfg.dropout,
+                use_moe=cfg.use_moe, use_rope=(cfg.pos_encoding == 'rope'), ffn_dim=cfg.ffn_dim)
             for _ in range(cfg.n_layers)
         ])
         self.norm = nn.LayerNorm(d)
+
+        # Ablation: absolute sinusoidal positional encoding added at the embedding
+        if cfg.pos_encoding == 'sinusoidal':
+            self.register_buffer('abs_pe', _sinusoidal_pe(cfg.max_len, d), persistent=False)
+        else:
+            self.abs_pe = None
 
         # Semantic cross-attention
         if cfg.use_semantics:
@@ -450,7 +471,10 @@ class TrajectoryMaskedAutoEncoder(nn.Module):
         e = e_st + e_kin
 
         e_dom = self.E_dom(domain_ids).unsqueeze(1)  # (B, 1, d)
-        e = self._layer_norm_emb(e + e_dom)
+        e = e + e_dom
+        if self.abs_pe is not None:
+            e = e + self.abs_pe[:e.size(1)].unsqueeze(0).to(e.dtype)
+        e = self._layer_norm_emb(e)
 
         return e
     
@@ -694,3 +718,12 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
     return torch.stack([-x2, x1], dim=-1).flatten(-2)
+
+def _sinusoidal_pe(max_len: int, d_model: int) -> torch.Tensor:
+    """Standard fixed sinusoidal absolute positional encoding (max_len, d_model)"""
+    pe = torch.zeros(max_len, d_model)
+    pos = torch.arange(max_len, dtype=torch.float32).unsqueeze(1)
+    div = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float32) * (-math.log(10000.0) / d_model))
+    pe[:, 0::2] = torch.sin(pos * div)
+    pe[:, 1::2] = torch.cos(pos * div)
+    return pe

@@ -376,9 +376,9 @@ def run_stage2(model: TrajectoryMaskedAutoEncoder, train_loader: DataLoader, val
             if e_sem is not None:
                 e_sem = e_sem.to(device)
 
-            # Detached semantic embedding for soft contrastive regulariser
+            # Detached semantic embedding for soft contrastive regularizer
             e_traj_det = None
-            if e_sem is not None:
+            if e_sem is not None and cfg.use_semantics and cfg.contrastive_lambda > 0:
                 with torch.no_grad():
                     e_traj_det = model.semantic_trajectory_embedding(e_sem, pad_mask)
 
@@ -754,10 +754,15 @@ def train(cfg: ModelConfig, args: argparse.Namespace) -> None:
         # Fresh, warm-start (ckpt without resume → weights only), or resume mid-Stage-1.
         # resume_state is only passed when actually resuming Stage 1, so a warm start
         # does not pull a (possibly Stage-2) optimizer state into a fresh Stage 1.
-        run_stage1(model, train_loader, val_loader, cfg, device, checkpoint_dir,
-                   hf_repo=hf_repo, start_epoch=resume_s1,
-                   resume_state=ckpt if resume_s1 else None, ckpt_name=stage1_ckpt,
-                   fresh_optim=getattr(args, 'fresh_optim', False))
+        # Stage 1 is the trajectory<->semantic contrastive alignment, so it is only valid
+        # with semantics; --no-semantics skips it entirely (and Stage 2 adds no regularizer).
+        if cfg.use_semantics:
+            run_stage1(model, train_loader, val_loader, cfg, device, checkpoint_dir,
+                       hf_repo=hf_repo, start_epoch=resume_s1,
+                       resume_state=ckpt if resume_s1 else None, ckpt_name=stage1_ckpt,
+                       fresh_optim=getattr(args, 'fresh_optim', False))
+        else:
+            logger.info('Skipping Stage 1 (contrastive): --no-semantics')
         run_stage2(model, train_loader, val_loader, cfg, device, checkpoint_dir, rng,
                    hf_repo=hf_repo, ckpt_name=stage2_ckpt)
     logger.info('Training complete. Best checkpoint: %s', checkpoint_dir / stage2_ckpt)
@@ -818,6 +823,11 @@ def main():
     parser.add_argument('--max-len', type=int, default=256)
     parser.add_argument('--alpha', type=float, default=0.05)
     parser.add_argument('--no-semantics', action='store_true')
+    # Ablation knobs
+    parser.add_argument('--contrastive-lambda', type=float, default=0.1)  # 0 -> no contrastive regulari`er
+    parser.add_argument('--no-moe', action='store_true')                  # MoE -> standard FFN
+    parser.add_argument('--pos-encoding', default='rope', choices=['rope', 'sinusoidal'])
+
     parser.add_argument('--checkpoint-dir', default='checkpoints')
     parser.add_argument('--run-name', default=None, metavar='NAME')
     parser.add_argument('--hf-repo', default=None, metavar='REPO_ID')
@@ -841,6 +851,9 @@ def main():
         lr=args.lr,
         sem_pred_alpha=args.alpha,
         use_semantics=not args.no_semantics,
+        contrastive_lambda=args.contrastive_lambda,
+        use_moe=not args.no_moe,
+        pos_encoding=args.pos_encoding,
         checkpoint_dir=args.checkpoint_dir,
         stage1_epochs=args.stage1_epochs,
         stage2_epochs=args.stage2_epochs,

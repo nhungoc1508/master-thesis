@@ -21,6 +21,10 @@ class ModelConfig:
     loss_w_temporal: float = 1.0
     loss_w_kin: float = 0.25
 
+    # Ablation toggles
+    use_moe: bool = True            # False -> standard FFN (hidden=ffn_dim) instead of MoE
+    pos_encoding: str = 'rope'      # 'rope' (sequence-index RoPE) or 'sinusoidal' (absolute PE)
+
     # Sparse Cross-Domain Mixture of Experts replacing per-block FFN
     n_experts: int = 8          # C: total number of expert networks
     moe_top_k: int = 4          # K: active experts per token
