@@ -260,8 +260,8 @@ _WT_STD = np.array([0.049923088401556015, 0.040688566863536835], dtype=np.float6
 def load_unitraj_model(repo_dir, model_path=None, device='cpu', max_len=200):
     repo_dir = Path(repo_dir)
     model_path = Path(model_path) if model_path else repo_dir / 'model.pt'
-    sys.path.insert(0, str(repo_dir))
-    from utils.unitraj import UniTraj                       # noqa: E402 (repo import)
+    sys.path.insert(0, str(repo_dir / 'utils'))
+    from unitraj import UniTraj
     model = UniTraj(trajectory_length=max_len, patch_size=1, embedding_dim=128,
                     encoder_layers=8, encoder_heads=4, decoder_layers=4,
                     decoder_heads=4, mask_ratio=0.5)
