@@ -251,3 +251,138 @@ def predict_and_save(model, units, task, device, *, batch_size=256, num_workers=
 def load_predictions(save_path):
     with open(Path(save_path), 'rb') as fh:
         return pickle.load(fh)
+
+# ===================== UniTraj baseline: predict + save =====================
+
+_WT_MEAN = np.array([5.3311563533497974e-05, -7.49477039789781e-05], dtype=np.float64)
+_WT_STD = np.array([0.049923088401556015, 0.040688566863536835], dtype=np.float64)
+
+def load_unitraj_model(repo_dir, model_path=None, device='cpu', max_len=200):
+    repo_dir = Path(repo_dir)
+    model_path = Path(model_path) if model_path else repo_dir / 'model.pt'
+    sys.path.insert(0, str(repo_dir))
+    from utils.unitraj import UniTraj                       # noqa: E402 (repo import)
+    model = UniTraj(trajectory_length=max_len, patch_size=1, embedding_dim=128,
+                    encoder_layers=8, encoder_heads=4, decoder_layers=4,
+                    decoder_heads=4, mask_ratio=0.5)
+    state = torch.load(str(model_path), map_location=device)
+    if isinstance(state, dict) and 'state_dict' in state and not any(k.startswith('encoder') for k in state):
+        state = state['state_dict']
+    model.load_state_dict(state)
+    print(f'Loaded UniTraj from {model_path} (trajectory_length={max_len})')
+    return model.to(device).eval()
+
+def _unitraj_stats(recs, scope):
+    if scope == 'worldtrace':
+        return defaultdict(lambda: (_WT_MEAN, _WT_STD))
+    by = defaultdict(list)
+    for r in recs:
+        by[r['dataset']].append(r['lonlat'] - r['lonlat'][0])
+    stats = {}
+    for name, offs in by.items():
+        allo = np.concatenate(offs, axis=0)
+        if scope == 'robust':
+            mean = np.median(allo, 0)
+            std = (np.percentile(allo, 84, 0) - np.percentile(allo, 16, 0)) / 2.0
+        else:
+            mean, std = allo.mean(0), allo.std(0)
+        std = np.where(std < 1e-9, 1.0, std)
+        stats[name] = (mean, std)
+    return stats
+
+@torch.no_grad()
+def predict_and_save_unitraj(model, units, task, device, *, norm='robust', intervals='clamp',
+                             clamp_dt=15.0, batch_size=256, save_path=None, store_full_pred=True):
+    if isinstance(units, (str, Path)):
+        units = [units]
+    units = [Path(u) for u in units]
+    max_len = int(model.encoder.num_tokens)
+
+    traj_ids_by_ds, ds_counter = {}, defaultdict(int)
+    for u in units:
+        tj = u / 'traj_ids.json'
+        traj_ids_by_ds[u.name] = json.loads(tj.read_text()) if tj.exists() else None
+
+    ds = BenchmarkDataset(units, task=task, with_sem=False)
+    recs = []
+    for j in range(len(ds)):
+        it = ds[j]
+        name = it['dataset']
+        tids = traj_ids_by_ds.get(name)
+        c = ds_counter[name]; ds_counter[name] += 1
+        traj_id = tids[c] if (tids is not None and c < len(tids)) else f'{name}:{c}'
+        tlen = int(it['traj_len'])
+        if tlen > max_len:
+            continue
+        coords = it['coords'][:tlen].numpy(); d = it['denorm']
+        lat = coords[:, 0] * d['bbox_half'] + d['lat0']
+        lon = coords[:, 1] * d['bbox_half'] + d['lon0']
+        lonlat = np.stack([lon, lat], axis=1).astype(np.float64)
+        dt = np.expm1(it['tau'][:tlen, 3].numpy().astype(np.float64) * d['log_max_dt'])
+        pos = it['pos_mask'][:tlen].numpy(); pad = it['pad_mask'][:tlen].numpy()
+        masked = np.where(pos & ~pad)[0]
+        if len(masked) == 0 or len(masked) >= tlen:
+            continue
+        recs.append({'traj_id': traj_id, 'dataset': name,
+                     'domain': _DOMAIN_NAME[int(it['domain_id'])],
+                     'lonlat': lonlat, 'dt': dt, 'masked': masked, 'tlen': tlen})
+
+    stats = _unitraj_stats(recs, norm)
+
+    buckets = defaultdict(list)
+    for i, r in enumerate(recs):
+        buckets[len(r['masked'])].append(i)
+
+    records = []
+    overall, by_domain, by_dataset = [], defaultdict(list), defaultdict(list)
+    for K, idxs in buckets.items():
+        for b0 in range(0, len(idxs), batch_size):
+            chunk = idxs[b0:b0 + batch_size]
+            B = len(chunk)
+            traj = np.zeros((B, 2, max_len), np.float32)
+            interv = np.zeros((B, max_len), np.float32)
+            mask_idx = np.zeros((B, K), np.int64)
+            for bi, ri in enumerate(chunk):
+                r = recs[ri]; mean, std = stats[r['dataset']]; t = r['tlen']
+                traj[bi, :, :t] = ((r['lonlat'] - r['lonlat'][0] - mean) / std).T.astype(np.float32)
+                dt = np.clip(r['dt'], 0.0, clamp_dt) if intervals == 'clamp' else r['dt']
+                interv[bi, :t] = dt.astype(np.float32)
+                mask_idx[bi] = r['masked']
+            interv_t = None if intervals == 'none' else torch.from_numpy(interv).to(device)
+            pred, _ = model(torch.from_numpy(traj).to(device), interv_t,
+                            torch.from_numpy(mask_idx).to(device))
+            pred = pred.cpu().numpy()
+            for bi, ri in enumerate(chunk):
+                r = recs[ri]; mean, std = stats[r['dataset']]; t = r['tlen']; m = r['masked']
+                pworld = pred[bi].T[:t] * std + mean + r['lonlat'][0]
+                tlat, tlon = r['lonlat'][:, 1], r['lonlat'][:, 0]
+                plat, plon = pworld[:, 1], pworld[:, 0]
+                err = metrics.haversine_m(tlat[m], tlon[m], plat[m], plon[m])
+                overall.append(err)
+                by_domain[r['domain']].append(err)
+                by_dataset[r['dataset']].append(err)
+                mask_full = np.zeros(t, dtype=bool); mask_full[m] = True
+                rec = {'traj_id': r['traj_id'], 'dataset': r['dataset'], 'domain': r['domain'],
+                       'traj_len': t, 'mask': mask_full, 'masked_idx': m.astype(np.int32),
+                       'true_lat': tlat.astype(np.float32), 'true_lon': tlon.astype(np.float32),
+                       'err_m': err.astype(np.float32)}
+                if store_full_pred:
+                    rec['pred_lat'], rec['pred_lon'] = plat.astype(np.float32), plon.astype(np.float32)
+                else:
+                    rec['pred_lat'], rec['pred_lon'] = plat[m].astype(np.float32), plon[m].astype(np.float32)
+                records.append(rec)
+
+    result = {'records': records, 'metrics': {
+        'overall': metrics.aggregate(overall),
+        'by_domain': {k: metrics.aggregate(v) for k, v in sorted(by_domain.items())},
+        'by_dataset': {k: metrics.aggregate(v) for k, v in sorted(by_dataset.items())}}}
+
+    if save_path is not None:
+        save_path = Path(save_path); save_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(save_path, 'wb') as fh:
+            pickle.dump({'records': records, 'metrics': result['metrics'],
+                         'meta': {'model': 'unitraj', 'task': task, 'norm': norm,
+                                  'intervals': intervals, 'clamp_dt': clamp_dt, 'max_len': max_len,
+                                  'store_full_pred': store_full_pred}}, fh)
+        print(f'Saved {len(records)} UniTraj predictions -> {save_path}')
+    return result
