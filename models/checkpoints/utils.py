@@ -1,4 +1,5 @@
 import json
+import pickle
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -147,3 +148,106 @@ def predict_trajectories(model, unit_dir, task, device, with_sem=True,
             'err_m': err
         })
     return records
+
+@torch.no_grad()
+def predict_and_save(model, units, task, device, *, batch_size=256, num_workers=4,
+                     with_sem=True, max_len=200, save_path=None, store_full_pred=True):
+    if isinstance(units, (str, Path)):
+        units = [units]
+    units = [Path(u) for u in units]
+
+    traj_ids_by_ds, ds_counter = {}, defaultdict(int)
+    for u in units:
+        tj = u / 'traj_ids.json'
+        traj_ids_by_ds[u.name] = json.loads(tj.read_text()) if tj.exists() else None
+
+    ds = BenchmarkDataset(units, task=task, with_sem=with_sem)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
+                        collate_fn=collate, num_workers=num_workers)
+
+    records = []
+    overall, by_domain, by_dataset = [], defaultdict(list), defaultdict(list)
+
+    for batch in loader:
+        e_sem = batch['e_sem']
+        out = model.forward(
+            x_spatial=batch['x_spatial'].to(device),
+            tau=batch['tau'].to(device),
+            kinematics=batch['kinematics'].to(device),
+            coords=batch['coords'].to(device),
+            pad_mask=batch['pad_mask'].to(device),
+            pos_mask=batch['pos_mask'].to(device),
+            domain_ids=batch['domain_id'].to(device),
+            e_sem=e_sem.to(device) if e_sem is not None else None
+        )
+        pred = out['pred'][..., :2].cpu().numpy()
+        target = batch['target_coords'].numpy()
+        pos = batch['pos_mask'].numpy()
+        pad = batch['pad_mask'].numpy()
+        tlen = batch['traj_len'].numpy()
+        doms = batch['domain_id'].numpy()
+        names = batch['dataset']
+        denorms = batch['denorm']
+
+        for b in range(pred.shape[0]):
+            name = names[b]
+            tids = traj_ids_by_ds.get(name)
+            j = ds_counter[name]; ds_counter[name] += 1
+            traj_id = tids[j] if (tids is not None and j < len(tids)) else f'{name}:{j}'
+
+            n = int(tlen[b])
+            if max_len is not None and n > max_len:
+                continue
+            mask = pos[b, :n] & ~pad[b, :n]
+            if not mask.any():
+                continue
+
+            dn = denorms[b]
+            tlat, tlon = metrics.denorm_coords(target[b, :n], dn['bbox_half'], dn['lat0'], dn['lon0'])
+            plat, plon = metrics.denorm_coords(pred[b, :n], dn['bbox_half'], dn['lat0'], dn['lon0'])
+            err = metrics.haversine_m(tlat[mask], tlon[mask], plat[mask], plon[mask])
+
+            overall.append(err)
+            by_domain[_DOMAIN_NAME[int(doms[b])]].append(err)
+            by_dataset[name].append(err)
+
+            rec = {
+                'traj_id': traj_id,
+                'dataset': name,
+                'domain': _DOMAIN_NAME[int(doms[b])],
+                'traj_len': n,
+                'mask': mask,
+                'masked_idx': np.where(mask)[0].astype(np.int32),
+                'true_lat': tlat.astype(np.float32),
+                'true_lon': tlon.astype(np.float32),
+                'err_m': err.astype(np.float32),
+            }
+            if store_full_pred:
+                rec['pred_lat'], rec['pred_lon'] = plat.astype(np.float32), plon.astype(np.float32)
+            else:
+                rec['pred_lat'], rec['pred_lon'] = plat[mask].astype(np.float32), plon[mask].astype(np.float32)
+            records.append(rec)
+
+    result = {
+        'records': records,
+        'metrics': {
+            'overall': metrics.aggregate(overall),
+            'by_domain': {k: metrics.aggregate(v) for k, v in sorted(by_domain.items())},
+            'by_dataset': {k: metrics.aggregate(v) for k, v in sorted(by_dataset.items())},
+        },
+    }
+
+    if save_path is not None:
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(save_path, 'wb') as fh:
+            pickle.dump({'records': records, 'metrics': result['metrics'],
+                         'meta': {'task': task, 'with_sem': with_sem, 'max_len': max_len,
+                                  'store_full_pred': store_full_pred}}, fh)
+        print(f'Saved {len(records)} predictions -> {save_path}')
+
+    return result
+
+def load_predictions(save_path):
+    with open(Path(save_path), 'rb') as fh:
+        return pickle.load(fh)
