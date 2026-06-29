@@ -212,6 +212,7 @@ def predict_and_save(model, units, task, device, *, batch_size=256, num_workers=
             by_dataset[name].append(err)
 
             rec = {
+                'uid': f'{name}#{j}',          # globally-unique (traj_id is NOT unique across days)
                 'traj_id': traj_id,
                 'dataset': name,
                 'domain': _DOMAIN_NAME[int(doms[b])],
@@ -323,7 +324,7 @@ def predict_and_save_unitraj(model, units, task, device, *, norm='robust', inter
         masked = np.where(pos & ~pad)[0]
         if len(masked) == 0 or len(masked) >= tlen:
             continue
-        recs.append({'traj_id': traj_id, 'dataset': name,
+        recs.append({'uid': f'{name}#{c}', 'traj_id': traj_id, 'dataset': name,
                      'domain': _DOMAIN_NAME[int(it['domain_id'])],
                      'lonlat': lonlat, 'dt': dt, 'masked': masked, 'tlen': tlen})
 
@@ -362,7 +363,7 @@ def predict_and_save_unitraj(model, units, task, device, *, norm='robust', inter
                 by_domain[r['domain']].append(err)
                 by_dataset[r['dataset']].append(err)
                 mask_full = np.zeros(t, dtype=bool); mask_full[m] = True
-                rec = {'traj_id': r['traj_id'], 'dataset': r['dataset'], 'domain': r['domain'],
+                rec = {'uid': r['uid'], 'traj_id': r['traj_id'], 'dataset': r['dataset'], 'domain': r['domain'],
                        'traj_len': t, 'mask': mask_full, 'masked_idx': m.astype(np.int32),
                        'true_lat': tlat.astype(np.float32), 'true_lon': tlon.astype(np.float32),
                        'err_m': err.astype(np.float32)}
